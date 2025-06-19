@@ -1,0 +1,50 @@
+============================================================
+LSTM Model Backtest Report - Sequence Length: 20
+============================================================
+Generated: 2025-06-19 16:30:43
+Total Matches Evaluated: 174
+
+OVERALL PERFORMANCE
+------------------------------
+Accuracy: 0.621
+
+CLASS-WISE METRICS
+------------------------------
+
+HOME_WIN:
+  Precision: 0.716
+  Recall: 0.741
+  F1-Score: 0.728
+  Support: 85
+
+AWAY_WIN:
+  Precision: 0.579
+  Recall: 0.647
+  F1-Score: 0.611
+  Support: 51
+
+DRAW:
+  Precision: 0.414
+  Recall: 0.316
+  F1-Score: 0.358
+  Support: 38
+
+CONFUSION MATRIX
+------------------------------
+         Predicted
+         Home  Away  Draw
+Actual Home   63   12   10
+Actual Away   11   33    7
+Actual Draw   14   12   12
+
+BETTING PERFORMANCE (Hypothetical)
+------------------------------
+Win Rate: 0.621
+ROI: 0.776
+Profit/Loss: 135.00 units
+
+CONFIDENCE ANALYSIS
+------------------------------
+Mean Confidence: 0.636
+High Confidence (>0.6) Accuracy: 0.733
+High Confidence Predictions: 86
