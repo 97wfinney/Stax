@@ -1,0 +1,71 @@
+============================================================
+LSTM MODEL PROFITABILITY BACKTEST REPORT
+============================================================
+Generated: 2025-06-23 13:31:32
+Model: lstm_seq5 | Stake: £10.0 per bet
+
+OVERALL PERFORMANCE
+------------------------------
+Total Bets: 518
+Winning Bets: 312 (60.2%)
+Total Stake: £5,180.00
+Total P&L: £502.64
+ROI: 9.7%
+Average Odds: 2.30
+Max Drawdown: £-236.91
+Sharpe Ratio: 0.08
+
+PERFORMANCE BY PREDICTION TIME
+------------------------------
+
+30_min:
+  Bets: 174
+  Win Rate: 58.6%
+  P&L: £257.46
+  ROI: 14.8%
+  Avg Confidence: 0.566
+
+45_min:
+  Bets: 172
+  Win Rate: 59.9%
+  P&L: £105.93
+  ROI: 6.2%
+  Avg Confidence: 0.626
+
+60_min:
+  Bets: 172
+  Win Rate: 62.2%
+  P&L: £139.26
+  ROI: 8.1%
+  Avg Confidence: 0.638
+
+PERFORMANCE BY BET TYPE
+------------------------------
+
+HOME:
+  Bets: 259
+  Win Rate: 71.0%
+  P&L: £34.09
+  ROI: 1.3%
+  Avg Odds: 1.74
+
+AWAY:
+  Bets: 167
+  Win Rate: 53.9%
+  P&L: £95.69
+  ROI: 5.7%
+  Avg Odds: 2.39
+
+DRAW:
+  Bets: 92
+  Win Rate: 41.3%
+  P&L: £372.87
+  ROI: 40.5%
+  Avg Odds: 3.70
+
+HIGH CONFIDENCE BETS (>70%)
+------------------------------
+Bets: 190
+Win Rate: 75.8%
+P&L: £146.19
+ROI: 7.7%
