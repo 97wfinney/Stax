@@ -1,134 +1,207 @@
 #!/usr/bin/env python3
 import json
-import numpy as np
-import pandas as pd
 import warnings
-import joblib
-import tensorflow as tf
-
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
+
+import numpy as np
+import pandas as pd
+import joblib
+import tensorflow as tf
 from tqdm import tqdm
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, classification_report
 
 # -----------------------------------------------------------------------------
-# 1. CONFIGURATION  (all paths now resolved off project root)
+# 0. SILENCE TF WARNINGS
 # -----------------------------------------------------------------------------
-ROOT_DIR         = Path(__file__).resolve().parent
-# if this file lives in scripts/, step up one
-if ROOT_DIR.name == 'scripts':
-    ROOT_DIR = ROOT_DIR.parent
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+tf.get_logger().setLevel('ERROR')
 
-DATA_DIR         = ROOT_DIR / "data"
-TRAINING_DIR     = DATA_DIR / "Training"
-BACKTEST_DIR     = DATA_DIR / "Backtest"
-MODELS_DIR       = ROOT_DIR / "models"
-STAX_MODEL_DIR   = MODELS_DIR / "stax_model"
+# -----------------------------------------------------------------------------
+# 1. PATH CONFIGURATION
+# -----------------------------------------------------------------------------
+SCRIPT_DIR = Path(__file__).resolve().parent
+# if this file sits in 'scripts/', step up one to project root
+ROOT_DIR   = SCRIPT_DIR.parent if SCRIPT_DIR.name == 'scripts' else SCRIPT_DIR
 
-# Backtesting Configuration
-BETTING_MINUTES  = [10, 20, 30, 45, 60, 75]
-STAKE_PER_BET    = 10.0
+TRAINING_DIR   = ROOT_DIR / "data" / "Training"
+BACKTEST_DIR   = ROOT_DIR / "data" / "Backtest"
+MODELS_DIR     = ROOT_DIR / "models"
+STAX_MODEL_DIR = MODELS_DIR / "stax_GPT"
 
-# Feature lists for base models
+# ensure stax_model folder exists
+STAX_MODEL_DIR.mkdir(exist_ok=True, parents=True)
+
+# -----------------------------------------------------------------------------
+# 2. CONSTANTS
+# -----------------------------------------------------------------------------
+# Minutes at which to backtest
+BETTING_MINUTES = [10, 20, 30, 45, 60, 75]
+STAKE_PER_BET   = 10.0
+
+# Features for base models
 LR_FEATURES  = ['home_score', 'away_score', 'avg_home_odds', 'avg_away_odds', 'avg_draw_odds']
 XGB_FEATURES = [
-    'time_elapsed_s', 'home_score', 'away_score', 'score_diff',
+    'time_elapsed_s','home_score','away_score','score_diff',
     'avg_home_odds','avg_away_odds','avg_draw_odds',
     'std_home_odds','std_away_odds','std_draw_odds',
     'home_odds_momentum','away_odds_momentum','draw_odds_momentum',
     'prob_home','prob_away','prob_draw'
 ]
 
-
 # -----------------------------------------------------------------------------
-# 2. JSON → DataFrame helpers (unchanged from your working code)
+# 3. HELPERS: JSON → Tabular for Base Models
 # -----------------------------------------------------------------------------
-def get_team_names(match_name: str, odds_data: dict) -> Tuple[Optional[str], Optional[str]]:
+def get_team_names(match_name: str, odds_data: dict) -> Tuple[Optional[str],Optional[str]]:
     if ' vs ' in match_name:
         a,b = match_name.split(' vs ')
         return a.strip(), b.strip()
-    # fallback: pick first two non-"Draw" keys
-    keys = [k for bookmaker in odds_data.values() for k in bookmaker if k.lower()!='draw']
-    return (keys[0], keys[1]) if len(keys)>=2 else (None, None)
+    # fallback: pick first two non-Draw keys
+    keys = [k for book in odds_data.values() for k in book if k.lower()!='draw']
+    return (keys[0], keys[1]) if len(keys)>=2 else (None,None)
 
-def process_match_for_lr(json_data: List[Dict]) -> Tuple[Optional[pd.DataFrame], int]:
-    # ... same as before ...
-    # (omitted here for brevity—copy your full function verbatim)
-    ...
+def process_match_for_lr(json_data: List[dict]) -> Tuple[Optional[pd.DataFrame],int]:
+    if not json_data:
+        return None, -1
 
-def process_match_for_xgb(json_data: List[Dict]) -> Tuple[Optional[pd.DataFrame], int]:
-    # ... same as before ...
-    ...
+    match_name = json_data[0].get('match','Unknown')
+    home_team, away_team = get_team_names(match_name, json_data[0].get('odds',{}))
+    if not home_team or not away_team:
+        return None, -1
 
-def process_match_for_lstm_sequences(json_data: List[Dict], seq_len=5) -> Tuple[Optional[np.ndarray], int]:
-    # ... same as before ...
-    ...
-
-def get_lstm_features_df(json_data: List[Dict]) -> Optional[pd.DataFrame]:
-    # ... same as before ...
-    ...
-
-
-# -----------------------------------------------------------------------------
-# 3. META‐FEATURE GENERATION & TRAINING
-# -----------------------------------------------------------------------------
-def generate_meta_features(data_path: Path, models: Dict, scalers: Dict) -> pd.DataFrame:
-    print(f"Generating meta-features from data in: {data_path}")
-    json_files = list(data_path.glob('*.json'))
-    meta_data = []
-
-    for file in tqdm(json_files, desc="Processing matches for meta-features"):
-        match_data = json.loads(file.read_text())
-
-        df_lr,   outcome = process_match_for_lr(match_data)
-        df_xgb, _        = process_match_for_xgb(match_data)
-        seq_lstm, _      = process_match_for_lstm_sequences(match_data)
-        
-        if df_lr is None or df_xgb is None or seq_lstm is None or seq_lstm.shape[0]==0:
+    rows = []
+    for entry in json_data:
+        # parse scores
+        try:
+            h_s,a_s = map(int, entry['score'].split(' - '))
+        except:
             continue
 
-        # align indices, skip first 5 for LSTM warm-up
-        common_idx = df_xgb.index.intersection(df_lr.index)
-        if len(common_idx)<=5: continue
+        # collect each bookie’s odds
+        bookies = entry.get('odds',{})
+        h_odds = [b.get(home_team)   for b in bookies.values() if b.get(home_team)   is not None]
+        a_odds = [b.get(away_team)   for b in bookies.values() if b.get(away_team)   is not None]
+        d_odds = [b.get('Draw')      for b in bookies.values() if b.get('Draw')        is not None]
+        if not (h_odds and a_odds and d_odds):
+            continue
 
-        df_lr        = df_lr.loc[common_idx]
-        df_xgb       = df_xgb.loc[common_idx]
-        lstm_indices = common_idx[5:]
-        df_lr        = df_lr.loc[lstm_indices]
-        df_xgb       = df_xgb.loc[lstm_indices]
-        seq_lstm     = seq_lstm[:len(lstm_indices)]
+        rows.append({
+            'home_score':     h_s,
+            'away_score':     a_s,
+            'avg_home_odds':  np.mean(h_odds),
+            'avg_away_odds':  np.mean(a_odds),
+            'avg_draw_odds':  np.mean(d_odds),
+        })
 
-        # base‐model preds
-        Xlr   = scalers['lr'].transform(df_lr[LR_FEATURES])
-        pr_lr = models['lr'].predict_proba(Xlr)
+    if not rows:
+        return None, -1
 
-        Xxgb  = scalers['xgb'].transform(df_xgb[XGB_FEATURES])
-        pr_xgb= models['xgb'].predict_proba(Xxgb)
+    df = pd.DataFrame(rows)
+    fh, fa = df['home_score'].iloc[-1], df['away_score'].iloc[-1]
+    outcome = 0 if fh>fa else (1 if fa>fh else 2)
+    return df, outcome
 
-        flat_lstm   = seq_lstm.reshape(-1, seq_lstm.shape[2])
-        scaled_flat = scalers['lstm'].transform(flat_lstm)
-        Xlstm       = scaled_flat.reshape(seq_lstm.shape)
-        pr_lstm     = models['lstm'].predict(Xlstm, verbose=0)
+def process_match_for_xgb(json_data: List[dict]) -> Tuple[Optional[pd.DataFrame],int]:
+    df, outcome = process_match_for_lr(json_data)
+    if df is None or df.empty:
+        return None, -1
 
-        # combine into final meta‐rows
-        for i in range(len(pr_lr)):
-            meta_data.append({
-                'p_lr_H':   pr_lr[i][0],   'p_lr_A':   pr_lr[i][1],   'p_lr_D':   pr_lr[i][2],
-                'p_xgb_H':  pr_xgb[i][0],  'p_xgb_A':  pr_xgb[i][1],  'p_xgb_D':  pr_xgb[i][2],
-                'p_lstm_H': pr_lstm[i][0], 'p_lstm_A': pr_lstm[i][1], 'p_lstm_D': pr_lstm[i][2],
+    df = df.copy()
+    df['score_diff'] = df['home_score'] - df['away_score']
+    # rolling & momentum
+    df['std_home_odds']    = df['avg_home_odds'].rolling(5).std().fillna(0)
+    df['std_away_odds']    = df['avg_away_odds'].rolling(5).std().fillna(0)
+    df['std_draw_odds']    = df['avg_draw_odds'].rolling(5).std().fillna(0)
+    df['home_odds_momentum']= df['avg_home_odds'].diff().rolling(5).mean().fillna(0)
+    df['away_odds_momentum']= df['avg_away_odds'].diff().rolling(5).mean().fillna(0)
+    df['draw_odds_momentum']= df['avg_draw_odds'].diff().rolling(5).mean().fillna(0)
+    # implied probabilities
+    df['prob_home']  = 1/df['avg_home_odds']
+    df['prob_away']  = 1/df['avg_away_odds']
+    df['prob_draw']  = 1/df['avg_draw_odds']
+    # time stamp assuming 40s intervals
+    df['time_elapsed_s']= np.arange(len(df))*40
+
+    return df.dropna(), outcome
+
+def process_match_for_lstm_sequences(json_data: List[dict], seq_len=5) -> Tuple[Optional[np.ndarray],int]:
+    df, outcome = process_match_for_lr(json_data)
+    if df is None or len(df) < seq_len:
+        return None, -1
+
+    feats = df[['avg_home_odds','avg_away_odds','avg_draw_odds']].copy()
+    feats['score_diff'] = df['home_score'] - df['away_score']
+
+    seqs = []
+    for i in range(seq_len, len(feats)+1):
+        seqs.append(feats.iloc[i-seq_len:i].values)
+    return np.array(seqs), outcome
+
+def get_lstm_features_df(json_data: List[dict]) -> Optional[pd.DataFrame]:
+    df, _ = process_match_for_lr(json_data)
+    if df is None or df.empty:
+        return None
+    out = df[['avg_home_odds','avg_away_odds','avg_draw_odds']].copy()
+    out['score_diff'] = df['home_score'] - df['away_score']
+    return out
+
+# -----------------------------------------------------------------------------
+# 4. META-FEATURE GENERATION
+# -----------------------------------------------------------------------------
+def generate_meta_features(data_dir: Path,
+                           models: Dict[str,any],
+                           scalers: Dict[str,any]) -> pd.DataFrame:
+    print(f"Generating meta-features from {data_dir}")
+    files = list(data_dir.glob("*.json"))
+    rows  = []
+
+    for fp in tqdm(files, desc="Matches"):
+        raw = json.loads(fp.read_text())
+        df_lr,   outcome = process_match_for_lr(raw)
+        df_xgb,  _       = process_match_for_xgb(raw)
+        seqs,    _       = process_match_for_lstm_sequences(raw)
+        if df_lr is None or df_xgb is None or seqs is None or seqs.shape[0]==0:
+            continue
+
+        # align to indices where all three exist, skip first seq_len rows
+        idx = df_xgb.index.intersection(df_lr.index)
+        if len(idx) <= seqs.shape[1]:
+            continue
+
+        df_lr = df_lr.loc[idx]
+        df_xgb= df_xgb.loc[idx]
+        start = seqs.shape[1]  # 5
+        df_lr = df_lr.iloc[start:]
+        df_xgb= df_xgb.iloc[start:]
+        seqs   = seqs[:len(df_lr)]
+
+        # base predictions
+        pred_lr   = models['lr'].predict_proba(scalers['lr'].transform(df_lr[LR_FEATURES]))
+        pred_xgb  = models['xgb'].predict_proba(scalers['xgb'].transform(df_xgb[XGB_FEATURES]))
+        flat      = seqs.reshape(-1, seqs.shape[2])
+        flat_scl  = scalers['lstm'].transform(flat)
+        pred_lstm = models['lstm'].predict(flat_scl.reshape(seqs.shape), verbose=0)
+
+        for i in range(len(pred_lr)):
+            rows.append({
+                'p_lr_H':   pred_lr[i][0], 'p_lr_A':   pred_lr[i][1], 'p_lr_D':   pred_lr[i][2],
+                'p_xgb_H':  pred_xgb[i][0],'p_xgb_A':  pred_xgb[i][1],'p_xgb_D':  pred_xgb[i][2],
+                'p_lstm_H': pred_lstm[i][0],'p_lstm_A': pred_lstm[i][1],'p_lstm_D': pred_lstm[i][2],
                 'final_outcome': outcome
             })
 
-    return pd.DataFrame(meta_data)
+    return pd.DataFrame(rows)
 
-
+# -----------------------------------------------------------------------------
+# 5. TRAIN Stax META-MODEL
+# -----------------------------------------------------------------------------
 def train_stax_model():
-    print("--- Starting Stax Model Training Pipeline ---")
-    print("Loading base models and scalers...")
-
-    models = {
+    print("\n=== Training Stax Meta-Model ===")
+    # load base models + scalers
+    models  = {
         'lr':   joblib.load(MODELS_DIR/"logistic_regression_model"/"logistic_regression_model.joblib"),
         'xgb':  joblib.load(MODELS_DIR/"xgboost_model"/"xgboost_model.joblib"),
         'lstm': tf.keras.models.load_model(MODELS_DIR/"lstm_seq5"/"lstm_seq5.h5")
@@ -139,109 +212,110 @@ def train_stax_model():
         'lstm': joblib.load(MODELS_DIR/"lstm_seq5"/"scaler_seq5.pkl")
     }
 
-    meta_df = generate_meta_features(TRAINING_DIR, models, scalers)
-    if meta_df.empty:
-        print("No meta-features generated. Exiting.")
+    meta = generate_meta_features(TRAINING_DIR, models, scalers)
+    if meta.empty:
+        print("✖ No meta-features generated; aborting.")
         return None, None, None, None
 
-    print(f"Generated {len(meta_df)} samples for training.")
-    X = meta_df.drop('final_outcome', axis=1)
-    y = meta_df['final_outcome']
+    print(f"✔ Generated {len(meta)} samples")
+    X = meta.drop('final_outcome', axis=1)
+    y = meta['final_outcome']
 
-    stax_scaler = StandardScaler()
-    Xs = stax_scaler.fit_transform(X)
+    stax_scaler = StandardScaler().fit(X)
+    Xs          = stax_scaler.transform(X)
 
-    stax_model = LogisticRegression(multi_class='multinomial', solver='lbfgs', random_state=42)
+    stax_model  = LogisticRegression(multi_class='multinomial',solver='lbfgs',max_iter=1000,random_state=42)
     stax_model.fit(Xs, y)
 
-    print("\n--- Training evaluation ---")
+    print("\n-- Training metrics --")
     preds = stax_model.predict(Xs)
-    print(f"Train accuracy: {accuracy_score(y, preds):.4f}")
+    print(f"Accuracy: {accuracy_score(y, preds):.4f}")
     print(classification_report(y, preds, target_names=['Home Win','Away Win','Draw']))
 
-    STAX_MODEL_DIR.mkdir(exist_ok=True)
-    joblib.dump(stax_model, STAX_MODEL_DIR/"stax_model.joblib")
+    # save
+    joblib.dump(stax_model,  STAX_MODEL_DIR/"stax_model.joblib")
     joblib.dump(stax_scaler, STAX_MODEL_DIR/"stax_scaler.joblib")
-    print(f"Saved Stax model + scaler to {STAX_MODEL_DIR}\n")
+    print(f"✔ Saved Stax model & scaler to {STAX_MODEL_DIR}")
 
     return stax_model, stax_scaler, models, scalers
 
-
 # -----------------------------------------------------------------------------
-# 4. BACKTEST
+# 6. BACKTEST
 # -----------------------------------------------------------------------------
 def backtest_stax_model(stax_model, stax_scaler, base_models, base_scalers):
-    print("\n--- Starting Stax Model Backtesting ---")
-    backtest_files = list(BACKTEST_DIR.glob("*.json"))
+    print("\n=== Backtesting Stax Model ===")
+    files   = list(BACKTEST_DIR.glob("*.json"))
     results = []
 
-    for file in tqdm(backtest_files, desc="Backtesting Matches"):
-        match_data = json.loads(file.read_text())
-        df_xgb_full, outcome = process_match_for_xgb(match_data)
-        lstm_feats_df       = get_lstm_features_df(match_data)
-        if df_xgb_full is None or lstm_feats_df is None or outcome==-1:
+    for fp in tqdm(files, desc="Backtest"):
+        raw = json.loads(fp.read_text())
+        df_xgb, outcome = process_match_for_xgb(raw)
+        lstm_df        = get_lstm_features_df(raw)
+        if df_xgb is None or lstm_df is None or outcome<0:
             continue
 
         for minute in BETTING_MINUTES:
-            t = minute * 60
-            if t > df_xgb_full['time_elapsed_s'].iloc[-1]:
+            tsec = minute * 60
+            if tsec > df_xgb['time_elapsed_s'].iloc[-1]:
                 continue
 
-            # find row closest to desired second
-            idx = (df_xgb_full['time_elapsed_s'] - t).abs().idxmin()
-            row= df_xgb_full.loc[idx]
+            # pick the row closest in time
+            idx = (df_xgb['time_elapsed_s'] - tsec).abs().idxmin()
+            row = df_xgb.loc[idx]
 
-            # LR prediction
-            lr_f = row[LR_FEATURES].values.reshape(1,-1)
-            pr_lr  = base_models['lr'].predict_proba(base_scalers['lr'].transform(lr_f))[0]
+            # LR
+            lr_feat = row[LR_FEATURES].values.reshape(1,-1)
+            pr_lr   = base_models['lr'].predict_proba(base_scalers['lr'].transform(lr_feat))[0]
 
-            # XGB prediction
-            xgb_f = row[XGB_FEATURES].values.reshape(1,-1)
-            pr_xgb = base_models['xgb'].predict_proba(base_scalers['xgb'].transform(xgb_f))[0]
+            # XGB
+            xgb_feat= row[XGB_FEATURES].values.reshape(1,-1)
+            pr_xgb  = base_models['xgb'].predict_proba(base_scalers['xgb'].transform(xgb_feat))[0]
 
-            # LSTM prediction
-            start_idx = idx - 4  # seq_len=5
-            if start_idx<0: continue
-            seq_df = lstm_feats_df.loc[start_idx:idx]
-            if len(seq_df)!=5: continue
-            arr  = base_scalers['lstm'].transform(seq_df.values)
-            pr_lstm = base_models['lstm'].predict(arr.reshape(1,5,arr.shape[1]), verbose=0)[0]
+            # LSTM
+            seq_len = lstm_df.shape[1] if hasattr(lstm_df,'shape') else 5
+            start   = idx - (seq_len-1)
+            if start<0: continue
+            seq     = lstm_df.loc[start:idx].values
+            pr_lstm = base_models['lstm'].predict(
+                base_scalers['lstm'].transform(seq).reshape(1,seq_len,seq.shape[1]), verbose=0
+            )[0]
 
-            # meta‐model
-            meta  = np.concatenate([pr_lr, pr_xgb, pr_lstm]).reshape(1,-1)
-            stx_p = stax_scaler.transform(meta)
-            pr_stx= stax_model.predict_proba(stx_p)[0]
-            choice = np.argmax(pr_stx)
-            odds_map = {0:'avg_home_odds',1:'avg_away_odds',2:'avg_draw_odds'}
-            od   = row[odds_map[choice]]
-            correct = (choice==outcome)
-            pnl     = (STAKE_PER_BET*od - STAKE_PER_BET) if correct else -STAKE_PER_BET
+            # meta
+            meta_feat = np.concatenate([pr_lr, pr_xgb, pr_lstm]).reshape(1,-1)
+            pr_stx    = stax_model.predict_proba(stax_scaler.transform(meta_feat))[0]
+            choice    = int(np.argmax(pr_stx))
+            odds_map  = {0:'avg_home_odds',1:'avg_away_odds',2:'avg_draw_odds'}
+            od        = row[odds_map[choice]]
+            correct   = (choice == outcome)
+            pnl       = (STAKE_PER_BET*od - STAKE_PER_BET) if correct else -STAKE_PER_BET
 
-            results.append({'strategy_minute': minute,'pnl':pnl,'correct':correct})
+            results.append({
+                'minute': minute,
+                'pnl':     pnl,
+                'correct': correct
+            })
 
     if not results:
-        print("No backtest results.")
+        print("✖ No backtest bets placed.")
         return
 
     df = pd.DataFrame(results)
-    summary = df.groupby('strategy_minute').agg(
+    sum_df = df.groupby('minute').agg(
         total_bets=('pnl','size'),
         total_pnl=('pnl','sum'),
         win_rate=('correct', lambda x: x.mean()*100)
     )
-    summary['total_staked'] = summary['total_bets']*STAKE_PER_BET
-    summary['roi_%']       = summary['total_pnl']/summary['total_staked']*100
+    sum_df['total_staked'] = sum_df['total_bets'] * STAKE_PER_BET
+    sum_df['roi_%']        = sum_df['total_pnl'] / sum_df['total_staked'] * 100
 
-    print("\n--- Backtest summary ---")
-    print(summary.round(2))
-
+    print("\n-- Backtest Summary --")
+    print(sum_df.round(2))
 
 # -----------------------------------------------------------------------------
-# 5. MAIN
+# 7. MAIN
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # train (won’t overwrite your originals)
-    stax_model, stax_scaler, base_models, base_scalers = train_stax_model()
+    stax_model, stax_scaler, bm, bs = train_stax_model()
     if stax_model:
-        backtest_stax_model(stax_model, stax_scaler, base_models, base_scalers)
-    print("\n--- Done ---")
+        backtest_stax_model(stax_model, stax_scaler, bm, bs)
+    print("\nDone.\n")

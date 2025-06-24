@@ -21,7 +21,7 @@ tf.get_logger().setLevel('ERROR')
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 MODELS_DIR = ROOT_DIR / "models"
-STAX_MODEL_DIR = MODELS_DIR / "stax_model"
+STAX_MODEL_DIR = MODELS_DIR / "stax_Gemini"
 
 # Backtesting Configuration
 BETTING_MINUTES = [10, 20, 30, 45, 60, 75]
