@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stax Meta-Model Pipeline V2
+Stax Meta-Model Pipeline V2 with K-Fold Cross-Validation
 Enhanced with value betting, confidence thresholds, and advanced ensemble strategies
 """
 
@@ -13,7 +13,7 @@ import xgboost as xgb
 import joblib
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, KFold
 from sklearn.metrics import accuracy_score, classification_report, log_loss
 from sklearn.preprocessing import StandardScaler
 import warnings
@@ -23,6 +23,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import List, Tuple, Optional, Dict
 from datetime import datetime
+import shutil
+import gc
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -32,13 +34,15 @@ tf.get_logger().setLevel('ERROR')
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 MODELS_DIR = ROOT_DIR / "models"
-STAX_MODEL_DIR = MODELS_DIR / "stax_Claude"
+STAX_MODEL_DIR = MODELS_DIR / "stax_kfold"
+TEMP_MODEL_DIR = MODELS_DIR / "temp_kfold"  # For temporary k-fold models
 
 # Model parameters
 MOMENTUM_WINDOW = 5
 STAKE_PER_BET = 10.0
 DEFAULT_STRATEGIES = [10, 20, 30, 45, 60]
 SEQUENCE_LENGTH = 5  # For LSTM
+K_FOLDS = 5  # Number of folds for cross-validation
 
 # Enhanced betting parameters
 MIN_CONFIDENCE_THRESHOLD = 0.65  # Only bet when confidence > 65%
@@ -56,33 +60,25 @@ XGB_FEATURES = [
 
 
 class EnhancedStaxModel:
-    """Enhanced Stax meta-model with advanced ensemble techniques."""
+    """Enhanced Stax meta-model with k-fold cross-validation."""
     
     def __init__(self):
         self.output_dir = STAX_MODEL_DIR
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_dir = TEMP_MODEL_DIR
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         
-        # Load base models and scalers
-        print("Loading base models...")
-        self.models = {
-            'lr': joblib.load(MODELS_DIR / "logistic_regression_model" / "logistic_regression_model.joblib"),
-            'xgb': joblib.load(MODELS_DIR / "xgboost_model" / "xgboost_model.joblib"),
-            'lstm': tf.keras.models.load_model(MODELS_DIR / "lstm_seq5" / "lstm_seq5.h5")
-        }
+        # These will store the final models trained on all data
+        self.models = {}
+        self.scalers = {}
         
-        self.scalers = {
-            'lr': joblib.load(MODELS_DIR / "logistic_regression_model" / "feature_scaler.joblib"),
-            'xgb': joblib.load(MODELS_DIR / "xgboost_model" / "feature_scaler.joblib"),
-            'lstm': joblib.load(MODELS_DIR / "lstm_seq5" / "scaler_seq5.pkl")
-        }
-        
-        # Meta-models (we'll try multiple approaches)
+        # Meta-models
         self.meta_models = {}
         self.meta_scalers = {}
         self.model_weights = None
-        self.ensemble_method = 'weighted_rf'  # Can be 'lr', 'rf', 'weighted', 'weighted_rf'
+        self.ensemble_method = 'weighted_rf'
         
-        print("Base models loaded successfully!")
+        print("Stax model initialized with K-fold cross-validation support")
     
     def get_team_names(self, match_name: str, odds_data: dict) -> Tuple[Optional[str], Optional[str]]:
         """Extract team names from match data."""
@@ -94,6 +90,350 @@ class EnhancedStaxModel:
         if len(non_draw_keys) >= 2:
             return non_draw_keys[0], non_draw_keys[1]
         return None, None
+    
+    def load_all_training_files(self, training_dir: Path) -> List[Path]:
+        """Load all training JSON files."""
+        json_files = list(training_dir.glob('*.json'))
+        print(f"Found {len(json_files)} training files")
+        return json_files
+    
+    def split_files_into_folds(self, json_files: List[Path], n_folds: int = K_FOLDS) -> List[List[Path]]:
+        """Split files into k folds for cross-validation."""
+        # Shuffle files for randomness
+        np.random.seed(42)
+        shuffled_files = np.random.permutation(json_files)
+        
+        # Split into folds
+        fold_size = len(shuffled_files) // n_folds
+        folds = []
+        
+        for i in range(n_folds):
+            start_idx = i * fold_size
+            if i == n_folds - 1:
+                # Last fold gets remaining files
+                fold_files = shuffled_files[start_idx:]
+            else:
+                end_idx = start_idx + fold_size
+                fold_files = shuffled_files[start_idx:end_idx]
+            folds.append(list(fold_files))
+        
+        print(f"Split {len(json_files)} files into {n_folds} folds")
+        for i, fold in enumerate(folds):
+            print(f"  Fold {i+1}: {len(fold)} files")
+        
+        return folds
+    
+    def train_lr_on_files(self, train_files: List[Path], fold_idx: int) -> Tuple[LogisticRegression, StandardScaler]:
+        """Train Logistic Regression model on specific files."""
+        print(f"  Training LR for fold {fold_idx+1}...")
+        
+        all_features = []
+        all_outcomes = []
+        
+        for file_path in tqdm(train_files, desc="    Processing LR files", leave=False):
+            with open(file_path, 'r') as f:
+                match_data = json.load(f)
+            
+            df, outcome = self.process_match_for_lr(match_data)
+            if df is not None and not df.empty:
+                all_features.extend(df[LR_FEATURES].values.tolist())
+                all_outcomes.extend([outcome] * len(df))
+        
+        X = np.array(all_features)
+        y = np.array(all_outcomes)
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        # Train model
+        model = LogisticRegression(
+            multi_class='multinomial',
+            solver='lbfgs',
+            max_iter=1000,
+            random_state=42
+        )
+        model.fit(X_scaled, y)
+        
+        return model, scaler
+    
+    def train_xgb_on_files(self, train_files: List[Path], fold_idx: int) -> Tuple[xgb.XGBClassifier, StandardScaler]:
+        """Train XGBoost model on specific files."""
+        print(f"  Training XGB for fold {fold_idx+1}...")
+        
+        all_dfs = []
+        
+        for file_path in tqdm(train_files, desc="    Processing XGB files", leave=False):
+            with open(file_path, 'r') as f:
+                match_data = json.load(f)
+            
+            df, outcome = self.process_match_for_xgb(match_data)
+            if df is not None and not df.empty:
+                df['final_outcome'] = outcome
+                all_dfs.append(df)
+        
+        # Combine all dataframes
+        master_df = pd.concat(all_dfs, ignore_index=True).dropna()
+        
+        X = master_df[XGB_FEATURES]
+        y = master_df['final_outcome']
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        # Train model
+        model = xgb.XGBClassifier(
+            objective='multi:softprob',
+            num_class=3,
+            n_estimators=200,  # Reduced for faster k-fold training
+            learning_rate=0.05,
+            max_depth=4,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            use_label_encoder=False,
+            eval_metric='mlogloss',
+            random_state=42,
+            verbosity=0
+        )
+        model.fit(X_scaled, y)
+        
+        return model, scaler
+    
+    def train_lstm_on_files(self, train_files: List[Path], fold_idx: int) -> Tuple[tf.keras.Model, StandardScaler]:
+        """Train LSTM model on specific files."""
+        print(f"  Training LSTM for fold {fold_idx+1}...")
+        
+        all_sequences = []
+        all_outcomes = []
+        
+        for file_path in tqdm(train_files, desc="    Processing LSTM files", leave=False):
+            with open(file_path, 'r') as f:
+                match_data = json.load(f)
+            
+            features, outcome = self.load_match_data_for_lstm(match_data)
+            if features is not None and len(features) >= SEQUENCE_LENGTH:
+                sequences, labels = self.create_sequences(features, outcome)
+                all_sequences.extend(sequences)
+                all_outcomes.extend(labels)
+        
+        X = np.array(all_sequences)
+        y = tf.keras.utils.to_categorical(all_outcomes, num_classes=3)
+        
+        # Scale features
+        scaler = StandardScaler()
+        flat = X.reshape(-1, X.shape[-1])
+        flat_scaled = scaler.fit_transform(flat)
+        X_scaled = flat_scaled.reshape(-1, SEQUENCE_LENGTH, X.shape[-1])
+        
+        # Build and train model
+        model = self.build_lstm_model()
+        model.fit(
+            X_scaled, y,
+            batch_size=64,
+            epochs=10,  # Reduced for faster k-fold training
+            verbose=0,
+            validation_split=0.1
+        )
+        
+        return model, scaler
+    
+    def build_lstm_model(self):
+        """Build LSTM model architecture."""
+        model = tf.keras.Sequential([
+            tf.keras.layers.LSTM(100, return_sequences=True, 
+                                input_shape=(SEQUENCE_LENGTH, 4)),
+            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.BatchNormalization(),
+            tf.keras.layers.LSTM(50, return_sequences=False),
+            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.BatchNormalization(),
+            tf.keras.layers.Dense(25, activation='relu'),
+            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dense(3, activation='softmax')
+        ])
+        
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(0.001),
+            loss='categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        return model
+    
+    def generate_kfold_meta_features(self, training_dir: Path) -> pd.DataFrame:
+        """Generate meta-features using k-fold cross-validation."""
+        print(f"\n=== Generating K-Fold Meta-Features ({K_FOLDS} folds) ===")
+        
+        # Load all files and split into folds
+        all_files = self.load_all_training_files(training_dir)
+        folds = self.split_files_into_folds(all_files, K_FOLDS)
+        
+        all_meta_features = []
+        
+        # For each fold
+        for fold_idx in range(K_FOLDS):
+            print(f"\nProcessing Fold {fold_idx + 1}/{K_FOLDS}")
+            
+            # Get train and validation files
+            val_files = folds[fold_idx]
+            train_files = []
+            for i in range(K_FOLDS):
+                if i != fold_idx:
+                    train_files.extend(folds[i])
+            
+            print(f"  Training on {len(train_files)} files, validating on {len(val_files)} files")
+            
+            # Train models on train_files
+            lr_model, lr_scaler = self.train_lr_on_files(train_files, fold_idx)
+            xgb_model, xgb_scaler = self.train_xgb_on_files(train_files, fold_idx)
+            lstm_model, lstm_scaler = self.train_lstm_on_files(train_files, fold_idx)
+            
+            # Generate predictions on val_files
+            print(f"  Generating predictions for fold {fold_idx+1}...")
+            fold_meta_features = self.generate_predictions_for_files(
+                val_files, lr_model, lr_scaler, xgb_model, xgb_scaler, 
+                lstm_model, lstm_scaler
+            )
+            
+            all_meta_features.append(fold_meta_features)
+            
+            # Clean up fold models to save memory
+            del lr_model, xgb_model, lstm_model
+            tf.keras.backend.clear_session()
+            gc.collect()
+        
+        # Combine all fold predictions
+        final_meta_df = pd.concat(all_meta_features, ignore_index=True)
+        print(f"\nGenerated {len(final_meta_df)} total meta-feature samples")
+        
+        return final_meta_df
+    
+    def generate_predictions_for_files(self, files: List[Path], 
+                                     lr_model, lr_scaler, 
+                                     xgb_model, xgb_scaler, 
+                                     lstm_model, lstm_scaler) -> pd.DataFrame:
+        """Generate predictions for a set of files using provided models."""
+        meta_data = []
+        
+        for file_path in tqdm(files, desc="    Generating predictions", leave=False):
+            with open(file_path, 'r') as f:
+                match_data = json.load(f)
+            
+            df_lr, outcome = self.process_match_for_lr(match_data)
+            df_xgb, _ = self.process_match_for_xgb(match_data)
+            lstm_features_df = self.get_lstm_features_df(match_data)
+            
+            if df_lr is None or df_xgb is None or lstm_features_df is None:
+                continue
+            
+            for idx in range(SEQUENCE_LENGTH, min(len(df_lr), len(df_xgb), len(lstm_features_df))):
+                try:
+                    # Get base model predictions
+                    lr_feats = df_lr.iloc[idx][LR_FEATURES]
+                    lr_scaled = lr_scaler.transform(lr_feats.values.reshape(1, -1))
+                    pred_lr = lr_model.predict_proba(lr_scaled)[0]
+                    
+                    xgb_feats = df_xgb.iloc[idx][XGB_FEATURES]
+                    xgb_scaled = xgb_scaler.transform(xgb_feats.values.reshape(1, -1))
+                    pred_xgb = xgb_model.predict_proba(xgb_scaled)[0]
+                    
+                    start_idx = idx - SEQUENCE_LENGTH + 1
+                    sequence_df = lstm_features_df.iloc[start_idx:idx+1]
+                    if len(sequence_df) != SEQUENCE_LENGTH:
+                        continue
+                    
+                    sequence_np = sequence_df.values
+                    scaled_sequence = lstm_scaler.transform(sequence_np)
+                    X_lstm = scaled_sequence.reshape(1, SEQUENCE_LENGTH, sequence_np.shape[1])
+                    pred_lstm = lstm_model.predict(X_lstm, verbose=0)[0]
+                    
+                    # Calculate additional meta-features
+                    entropy, std_dev, max_diff = self.calculate_model_disagreement(
+                        pred_lr, pred_xgb, pred_lstm
+                    )
+                    
+                    # Time decay feature
+                    time_factor = min(idx / 90, 1.0)
+                    
+                    # Odds-based features
+                    home_odds = df_xgb.iloc[idx]['avg_home_odds']
+                    away_odds = df_xgb.iloc[idx]['avg_away_odds']
+                    draw_odds = df_xgb.iloc[idx]['avg_draw_odds']
+                    
+                    # Market confidence
+                    market_overround = (1/home_odds + 1/away_odds + 1/draw_odds) - 1
+                    
+                    # Create meta-feature row
+                    row = {
+                        # Original predictions
+                        'p_lr_H': pred_lr[0], 'p_lr_A': pred_lr[1], 'p_lr_D': pred_lr[2],
+                        'p_xgb_H': pred_xgb[0], 'p_xgb_A': pred_xgb[1], 'p_xgb_D': pred_xgb[2],
+                        'p_lstm_H': pred_lstm[0], 'p_lstm_A': pred_lstm[1], 'p_lstm_D': pred_lstm[2],
+                        
+                        # Aggregated predictions
+                        'avg_H': (pred_lr[0] + pred_xgb[0] + pred_lstm[0]) / 3,
+                        'avg_A': (pred_lr[1] + pred_xgb[1] + pred_lstm[1]) / 3,
+                        'avg_D': (pred_lr[2] + pred_xgb[2] + pred_lstm[2]) / 3,
+                        
+                        # Disagreement metrics
+                        'entropy': entropy,
+                        'std_dev': std_dev,
+                        'max_disagreement': max_diff,
+                        
+                        # Additional features
+                        'time_factor': time_factor,
+                        'market_overround': market_overround,
+                        'score_diff': df_xgb.iloc[idx]['score_diff'],
+                        
+                        # Target
+                        'final_outcome': outcome
+                    }
+                    meta_data.append(row)
+                
+                except Exception as e:
+                    continue
+        
+        return pd.DataFrame(meta_data)
+    
+    def train_final_base_models(self, training_dir: Path):
+        """Train final base models on all training data."""
+        print("\n=== Training Final Base Models on All Data ===")
+        
+        all_files = self.load_all_training_files(training_dir)
+        
+        # Train each model on all data
+        print("\nTraining final Logistic Regression model...")
+        self.models['lr'], self.scalers['lr'] = self.train_lr_on_files(all_files, -1)
+        
+        print("\nTraining final XGBoost model...")
+        self.models['xgb'], self.scalers['xgb'] = self.train_xgb_on_files(all_files, -1)
+        
+        print("\nTraining final LSTM model...")
+        self.models['lstm'], self.scalers['lstm'] = self.train_lstm_on_files(all_files, -1)
+        
+        # Save final base models
+        print("\nSaving final base models...")
+        
+        # Create directories
+        lr_dir = self.output_dir / "logistic_regression"
+        xgb_dir = self.output_dir / "xgboost"
+        lstm_dir = self.output_dir / "lstm"
+        
+        for dir_path in [lr_dir, xgb_dir, lstm_dir]:
+            dir_path.mkdir(parents=True, exist_ok=True)
+        
+        # Save models and scalers
+        joblib.dump(self.models['lr'], lr_dir / "model.joblib")
+        joblib.dump(self.scalers['lr'], lr_dir / "scaler.joblib")
+        
+        joblib.dump(self.models['xgb'], xgb_dir / "model.joblib")
+        joblib.dump(self.scalers['xgb'], xgb_dir / "scaler.joblib")
+        
+        self.models['lstm'].save(lstm_dir / "model.h5")
+        joblib.dump(self.scalers['lstm'], lstm_dir / "scaler.pkl")
+        
+        print("Final base models saved successfully!")
     
     def process_match_for_lr(self, json_data: List[Dict]) -> Tuple[Optional[pd.DataFrame], int]:
         """Process match data for Logistic Regression model."""
@@ -160,15 +500,32 @@ class EnhancedStaxModel:
         lstm_feats_df['score_diff'] = df['home_score'] - df['away_score']
         return lstm_feats_df
     
+    def load_match_data_for_lstm(self, json_data: List[Dict]) -> Tuple[Optional[np.ndarray], int]:
+        """Load match data specifically for LSTM model."""
+        lstm_df = self.get_lstm_features_df(json_data)
+        if lstm_df is None:
+            return None, -1
+        
+        _, outcome = self.process_match_for_lr(json_data)
+        return lstm_df.values, outcome
+    
+    def create_sequences(self, features: np.ndarray, outcome: int) -> Tuple[List, List]:
+        """Create sequences for LSTM training."""
+        sequences, labels = [], []
+        for i in range(SEQUENCE_LENGTH, len(features)):
+            sequences.append(features[i-SEQUENCE_LENGTH:i])
+            labels.append(outcome)
+        return sequences, labels
+    
     def calculate_model_disagreement(self, pred_lr, pred_xgb, pred_lstm):
         """Calculate disagreement metrics between models."""
         predictions = np.array([pred_lr, pred_xgb, pred_lstm])
         
-        # Entropy of average prediction (uncertainty)
+        # Entropy of average prediction
         avg_pred = predictions.mean(axis=0)
         entropy = -np.sum(avg_pred * np.log(avg_pred + 1e-10))
         
-        # Standard deviation across models (disagreement)
+        # Standard deviation across models
         std_dev = predictions.std(axis=0).mean()
         
         # Max disagreement between any two models
@@ -179,90 +536,6 @@ class EnhancedStaxModel:
         
         return entropy, std_dev, max_diff
     
-    def generate_enhanced_meta_features(self, data_path: Path) -> pd.DataFrame:
-        """Generate enhanced meta-features with additional metrics."""
-        print(f"Generating enhanced meta-features from data in: {data_path}")
-        json_files = list(data_path.glob('*.json'))[:180]
-        meta_data = []
-
-        for file in tqdm(json_files, desc="Processing matches for meta-features"):
-            with open(file, 'r') as f:
-                match_data = json.load(f)[:180]
-
-            df_lr, outcome = self.process_match_for_lr(match_data)
-            df_xgb, _ = self.process_match_for_xgb(match_data)
-            lstm_features_df = self.get_lstm_features_df(match_data)
-            
-            if df_lr is None or df_xgb is None or lstm_features_df is None:
-                continue
-            
-            for idx in range(SEQUENCE_LENGTH, min(len(df_lr), len(df_xgb), len(lstm_features_df))):
-                try:
-                    # Get base model predictions
-                    lr_feats = df_lr.iloc[idx][LR_FEATURES]
-                    lr_scaled = self.scalers['lr'].transform(lr_feats.values.reshape(1, -1))
-                    pred_lr = self.models['lr'].predict_proba(lr_scaled)[0]
-                    
-                    xgb_feats = df_xgb.iloc[idx][XGB_FEATURES]
-                    xgb_scaled = self.scalers['xgb'].transform(xgb_feats.values.reshape(1, -1))
-                    pred_xgb = self.models['xgb'].predict_proba(xgb_scaled)[0]
-                    
-                    start_idx = idx - SEQUENCE_LENGTH + 1
-                    sequence_df = lstm_features_df.iloc[start_idx:idx+1]
-                    if len(sequence_df) != SEQUENCE_LENGTH:
-                        continue
-                    
-                    sequence_np = sequence_df.values
-                    scaled_sequence = self.scalers['lstm'].transform(sequence_np)
-                    X_lstm = scaled_sequence.reshape(1, SEQUENCE_LENGTH, sequence_np.shape[1])
-                    pred_lstm = self.models['lstm'].predict(X_lstm, verbose=0)[0]
-                    
-                    # Calculate additional meta-features
-                    entropy, std_dev, max_diff = self.calculate_model_disagreement(pred_lr, pred_xgb, pred_lstm)
-                    
-                    # Time decay feature (matches are more predictable later)
-                    time_factor = min(idx / 90, 1.0)  # Normalize to [0, 1]
-                    
-                    # Odds-based features
-                    home_odds = df_xgb.iloc[idx]['avg_home_odds']
-                    away_odds = df_xgb.iloc[idx]['avg_away_odds']
-                    draw_odds = df_xgb.iloc[idx]['avg_draw_odds']
-                    
-                    # Market confidence (lower total probability = more confident market)
-                    market_overround = (1/home_odds + 1/away_odds + 1/draw_odds) - 1
-                    
-                    # Create enhanced feature row
-                    row = {
-                        # Original predictions
-                        'p_lr_H': pred_lr[0], 'p_lr_A': pred_lr[1], 'p_lr_D': pred_lr[2],
-                        'p_xgb_H': pred_xgb[0], 'p_xgb_A': pred_xgb[1], 'p_xgb_D': pred_xgb[2],
-                        'p_lstm_H': pred_lstm[0], 'p_lstm_A': pred_lstm[1], 'p_lstm_D': pred_lstm[2],
-                        
-                        # Aggregated predictions
-                        'avg_H': (pred_lr[0] + pred_xgb[0] + pred_lstm[0]) / 3,
-                        'avg_A': (pred_lr[1] + pred_xgb[1] + pred_lstm[1]) / 3,
-                        'avg_D': (pred_lr[2] + pred_xgb[2] + pred_lstm[2]) / 3,
-                        
-                        # Disagreement metrics
-                        'entropy': entropy,
-                        'std_dev': std_dev,
-                        'max_disagreement': max_diff,
-                        
-                        # Additional features
-                        'time_factor': time_factor,
-                        'market_overround': market_overround,
-                        'score_diff': df_xgb.iloc[idx]['score_diff'],
-                        
-                        # Target
-                        'final_outcome': outcome
-                    }
-                    meta_data.append(row)
-                
-                except Exception as e:
-                    continue
-
-        return pd.DataFrame(meta_data)
-    
     def calculate_sample_weights(self, df: pd.DataFrame) -> np.ndarray:
         """Calculate sample weights based on model agreement and confidence."""
         weights = np.ones(len(df))
@@ -270,7 +543,7 @@ class EnhancedStaxModel:
         # Upweight samples where models agree
         avg_probs = df[['avg_H', 'avg_A', 'avg_D']].values
         max_probs = avg_probs.max(axis=1)
-        weights *= (1 + max_probs)  # Higher weight for confident predictions
+        weights *= (1 + max_probs)
         
         # Downweight samples with high disagreement
         weights *= (1 - df['std_dev'] * 0.5)
@@ -282,7 +555,7 @@ class EnhancedStaxModel:
     
     def train_meta_models(self, X: pd.DataFrame, y: pd.Series):
         """Train multiple meta-models and select the best."""
-        print(f"Training enhanced meta-models on {len(X)} samples...")
+        print(f"\nTraining enhanced meta-models on {len(X)} samples...")
         
         # Calculate sample weights
         sample_weights = self.calculate_sample_weights(X)
@@ -308,7 +581,7 @@ class EnhancedStaxModel:
             multi_class='multinomial',
             solver='lbfgs',
             max_iter=1000,
-            C=0.5,  # More regularization
+            C=0.5,
             random_state=42
         )
         self.meta_models['lr'].fit(X_train_scaled, y_train, sample_weight=w_train)
@@ -335,9 +608,8 @@ class EnhancedStaxModel:
         print("\n3. Optimizing model weights...")
         self.optimize_model_weights(X_train, y_train, X_val, y_val)
         
-        # 4. Weighted Random Forest (best of both worlds)
+        # 4. Weighted Random Forest
         print("\n4. Training Weighted RF with optimized features...")
-        # Create weighted features
         X_train_weighted = self.create_weighted_features(X_train)
         X_val_weighted = self.create_weighted_features(X_val)
         
@@ -452,7 +724,8 @@ class EnhancedStaxModel:
             'ensemble_method': self.ensemble_method,
             'min_confidence': MIN_CONFIDENCE_THRESHOLD,
             'min_value': MIN_VALUE_THRESHOLD,
-            'kelly_fraction': KELLY_FRACTION
+            'kelly_fraction': KELLY_FRACTION,
+            'k_folds': K_FOLDS
         }
         joblib.dump(config, self.output_dir / "stax_config.joblib")
         
@@ -460,10 +733,26 @@ class EnhancedStaxModel:
     
     def load_saved_models(self):
         """Load previously saved models."""
+        print("Loading saved models...")
+        
         # Load config
         config = joblib.load(self.output_dir / "stax_config.joblib")
         self.model_weights = config['model_weights']
         self.ensemble_method = config['ensemble_method']
+        
+        # Load base models
+        lr_dir = self.output_dir / "logistic_regression"
+        xgb_dir = self.output_dir / "xgboost"
+        lstm_dir = self.output_dir / "lstm"
+        
+        self.models['lr'] = joblib.load(lr_dir / "model.joblib")
+        self.scalers['lr'] = joblib.load(lr_dir / "scaler.joblib")
+        
+        self.models['xgb'] = joblib.load(xgb_dir / "model.joblib")
+        self.scalers['xgb'] = joblib.load(xgb_dir / "scaler.joblib")
+        
+        self.models['lstm'] = tf.keras.models.load_model(lstm_dir / "model.h5")
+        self.scalers['lstm'] = joblib.load(lstm_dir / "scaler.pkl")
         
         # Load meta-models
         for model_type in ['lr', 'rf', 'weighted_rf']:
@@ -474,7 +763,13 @@ class EnhancedStaxModel:
         # Load scalers
         self.meta_scalers['standard'] = joblib.load(self.output_dir / "meta_scaler_standard.joblib")
         
-        print("Loaded saved models")
+        print("All models loaded successfully!")
+    
+    def cleanup_temp_dir(self):
+        """Clean up temporary directory."""
+        if self.temp_dir.exists():
+            shutil.rmtree(self.temp_dir)
+            print("Cleaned up temporary files")
 
 
 class ValueBettingBacktester:
@@ -538,7 +833,7 @@ class ValueBettingBacktester:
                 
                 for file_path in tqdm(json_files, desc="Backtesting", leave=False):
                     with open(file_path, 'r') as f:
-                        match_data = json.load(f)[:180]  # Limit entries per match
+                        match_data = json.load(f)
                     
                     df_xgb, outcome = self.stax_model.process_match_for_xgb(match_data)
                     lstm_features_df = self.stax_model.get_lstm_features_df(match_data)
@@ -556,7 +851,7 @@ class ValueBettingBacktester:
                             continue
                         
                         try:
-                            # Generate predictions (same as before)
+                            # Generate predictions
                             target_row = df_xgb.iloc[target_idx]
                             
                             # Get base predictions
@@ -902,7 +1197,7 @@ class ValueBettingBacktester:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Enhanced Stax Meta-Model Pipeline')
+    parser = argparse.ArgumentParser(description='Enhanced Stax Meta-Model Pipeline with K-Fold CV')
     parser.add_argument('--mode', choices=['train', 'backtest', 'all'], 
                        default='all', help='Operation mode')
     parser.add_argument('--strategies', nargs='+', type=int, 
@@ -914,6 +1209,8 @@ def main():
     parser.add_argument('--value_thresholds', nargs='+', type=float,
                        default=[0.00, 0.05, 0.10, 0.15],
                        help='Value thresholds to test')
+    parser.add_argument('--k_folds', type=int, default=K_FOLDS,
+                       help='Number of folds for cross-validation')
     
     args = parser.parse_args()
     
@@ -921,23 +1218,35 @@ def main():
     stax = EnhancedStaxModel()
     
     if args.mode in ['train', 'all']:
-        print("=== Training Enhanced Stax Meta-Model ===")
+        print("=== Training Enhanced Stax Meta-Model with K-Fold Cross-Validation ===")
+        print(f"Using {args.k_folds}-fold cross-validation")
         
-        # Generate enhanced meta-features
-        meta_df = stax.generate_enhanced_meta_features(DATA_DIR / "Training")
+        # Generate k-fold meta-features
+        meta_df = stax.generate_kfold_meta_features(DATA_DIR / "Training")
         
         if meta_df.empty:
             print("No meta-features generated. Exiting.")
             return
         
-        print(f"Generated {len(meta_df)} enhanced samples for training")
+        print(f"\nGenerated {len(meta_df)} meta-feature samples using k-fold CV")
+        
+        # Save meta-features for inspection
+        meta_df.to_csv(stax.output_dir / "kfold_meta_features.csv", index=False)
+        print(f"Saved meta-features to {stax.output_dir / 'kfold_meta_features.csv'}")
         
         # Prepare data
-        X_meta = meta_df.drop('final_outcome', axis=1)
         y_meta = meta_df['final_outcome']
         
-        # Train multiple meta-models
+        # Train meta-models
         stax.train_meta_models(meta_df, y_meta)
+        
+        # Train final base models on all data
+        stax.train_final_base_models(DATA_DIR / "Training")
+        
+        # Clean up temporary directory
+        stax.cleanup_temp_dir()
+        
+        print("\n✅ Training complete!")
     
     if args.mode in ['backtest', 'all']:
         # Load trained models if only backtesting
