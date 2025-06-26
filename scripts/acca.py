@@ -33,14 +33,88 @@ REPORT_FILE = Path(__file__).resolve().parent / "acca_backtest_report.html"
 # --- Backtest Parameters ---
 # Using a dictionary to hold all groups of concurrent matches for testing
 ACCA_GROUPS = {
-    "Group 1: 5-Fold EFL Acca (2025-02-22)": [
+    "Group 1: 6-Fold EFL Acca (2025-02-12)": [
+        "bristol_city_vs_stoke_city__efl_match_data_2025-02-12_19-44-01.json",
+        "burnley_vs_hull_city__efl_match_data_2025-02-12_19-44-01.json",
+        "plymouth_argyle_vs_millwall__efl_match_data_2025-02-12_19-44-01.json",
+        "sheffield_united_vs_middlesbrough__efl_match_data_2025-02-12_19-44-01.json",
+        "sunderland_vs_luton__efl_match_data_2025-02-12_19-44-01.json",
+        "swansea_city_vs_sheffield_wednesday__efl_match_data_2025-02-12_19-44-01.json"
+    ],
+    "Group 2: 7-Fold EFL Acca (2025-02-12)": [
+        "bristol_city_vs_stoke_city__efl_match_data_2025-02-12_19-59-01.json",
+        "burnley_vs_hull_city__efl_match_data_2025-02-12_19-59-01.json",
+        "plymouth_argyle_vs_millwall__efl_match_data_2025-02-12_19-59-01.json",
+        "sheffield_united_vs_middlesbrough__efl_match_data_2025-02-12_19-59-01.json",
+        "sunderland_vs_luton__efl_match_data_2025-02-12_19-59-01.json",
+        "swansea_city_vs_sheffield_wednesday__efl_match_data_2025-02-12_19-59-01.json",
+        "west_bromwich_albion_vs_blackburn_rovers__efl_match_data_2025-02-12_19-59-01.json"
+    ],
+    "Group 3: 3-Fold EFL Acca (2025-02-15)": [
+        "cardiff_city_vs_bristol_city__efl_match_data_2025-02-15_12-29-01.json",
+        "oxford_united_vs_portsmouth__efl_match_data_2025-02-15_12-29-01.json",
+        "preston_north_end_vs_burnley__efl_match_data_2025-02-15_12-29-01.json"
+    ],
+    "Group 4: 7-Fold EFL Acca (2025-02-15)": [
+        "blackburn_rovers_vs_plymouth_argyle__efl_match_data_2025-02-15_14-59-01.json",
+        "hull_city_vs_norwich_city__efl_match_data_2025-02-15_14-59-01.json",
+        "luton_vs_sheffield_united__efl_match_data_2025-02-15_14-59-01.json",
+        "middlesbrough_vs_watford__efl_match_data_2025-02-15_14-59-01.json",
+        "millwall_vs_west_bromwich_albion__efl_match_data_2025-02-15_14-59-01.json",
+        "sheffield_wednesday_vs_coventry_city__efl_match_data_2025-02-15_14-59-01.json",
+        "stoke_city_vs_swansea_city__efl_match_data_2025-02-15_14-59-01.json"
+    ],
+    "Group 5: 2-Fold EFL Acca (2025-02-21)": [
+        "bristol_city_vs_middlesbrough__efl_match_data_2025-02-21_19-44-01.json",
+        "burnley_vs_sheffield_wednesday__efl_match_data_2025-02-21_19-44-01.json"
+    ],
+    "Group 6: 2-Fold EFL Acca (2025-02-21)": [
+        "bristol_city_vs_middlesbrough__efl_match_data_2025-02-21_19-59-01.json",
+        "burnley_vs_sheffield_wednesday__efl_match_data_2025-02-21_19-59-01.json"
+    ],
+    "Group 7: 3-Fold EFL Acca (2025-02-22)": [
+        "derby_county_vs_millwall__efl_match_data_2025-02-22_12-29-01.json",
+        "plymouth_argyle_vs_cardiff_city__efl_match_data_2025-02-22_12-29-01.json",
+        "sunderland_vs_hull_city__efl_match_data_2025-02-22_12-29-01.json"
+    ],
+    "Group 8: 5-Fold EFL Acca (2025-02-22)": [
         "coventry_city_vs_preston_north_end__efl_match_data_2025-02-22_14-59-01.json",
         "norwich_city_vs_stoke_city__efl_match_data_2025-02-22_14-59-01.json",
         "portsmouth_vs_queens_park_rangers__efl_match_data_2025-02-22_14-59-01.json",
         "swansea_city_vs_blackburn_rovers__efl_match_data_2025-02-22_14-59-01.json",
         "west_bromwich_albion_vs_oxford_united__efl_match_data_2025-02-22_14-59-01.json"
     ],
-    "Group 2: 11-Fold EFL Acca (2025-04-21)": [
+    "Group 9: 6-Fold EPL Acca (2025-04-02)": [
+        "bournemouth_vs_ipswich_town__epl_match_data_2025-04-02_19-58-01.json",
+        "brighton_and_hove_albion_vs_aston_villa__epl_match_data_2025-04-02_19-58-01.json",
+        "liverpool_vs_everton__epl_match_data_2025-04-02_19-58-01.json",
+        "manchester_city_vs_leicester_city__epl_match_data_2025-04-02_19-58-01.json",
+        "newcastle_united_vs_brentford__epl_match_data_2025-04-02_19-58-01.json",
+        "southampton_vs_crystal_palace__epl_match_data_2025-04-02_19-58-01.json"
+    ],
+    "Group 10: 9-Fold EFL Acca (2025-04-18)": [
+        "blackburn_rovers_vs_millwall__efl_match_data_2025-04-18_14-59-01.json",
+        "bristol_city_vs_sunderland__efl_match_data_2025-04-18_14-59-01.json",
+        "coventry_city_vs_west_bromwich_albion__efl_match_data_2025-04-18_14-59-01.json",
+        "middlesbrough_vs_plymouth_argyle__efl_match_data_2025-04-18_14-59-01.json",
+        "norwich_city_vs_portsmouth__efl_match_data_2025-04-18_14-59-01.json",
+        "preston_north_end_vs_queens_park_rangers__efl_match_data_2025-04-18_14-59-01.json",
+        "stoke_city_vs_sheffield_wednesday__efl_match_data_2025-04-18_14-59-01.json",
+        "swansea_city_vs_hull_city__efl_match_data_2025-04-18_14-59-01.json",
+        "watford_vs_burnley__efl_match_data_2025-04-18_14-59-01.json"
+    ],
+    "Group 11: 4-Fold EPL Acca (2025-04-19)": [
+        "brentford_vs_brighton_and_hove_albion__epl_match_data_2025-04-19_14-58-01.json",
+        "crystal_palace_vs_bournemouth__epl_match_data_2025-04-19_14-58-01.json",
+        "everton_vs_manchester_city__epl_match_data_2025-04-19_14-58-01.json",
+        "west_ham_united_vs_southampton__epl_match_data_2025-04-19_14-58-01.json"
+    ],
+    "Group 12: 3-Fold EPL Acca (2025-04-20)": [
+        "fulham_vs_chelsea__epl_match_data_2025-04-20_13-58-02.json",
+        "ipswich_town_vs_arsenal__epl_match_data_2025-04-20_13-58-02.json",
+        "manchester_united_vs_wolverhampton_wanderers__epl_match_data_2025-04-20_13-58-02.json"
+    ],
+    "Group 13: 11-Fold EFL Acca (2025-04-21)": [
         "cardiff_city_vs_oxford_united__efl_match_data_2025-04-21_14-59-01.json",
         "hull_city_vs_preston_north_end__efl_match_data_2025-04-21_14-59-01.json",
         "leeds_united_vs_stoke_city__efl_match_data_2025-04-21_14-59-01.json",
@@ -53,17 +127,6 @@ ACCA_GROUPS = {
         "sunderland_vs_blackburn_rovers__efl_match_data_2025-04-21_14-59-01.json",
         "west_bromwich_albion_vs_derby_county__efl_match_data_2025-04-21_14-59-01.json"
     ],
-    "Group 3: 3-Fold EPL Acca (2025-04-20)": [
-        "fulham_vs_chelsea__epl_match_data_2025-04-20_13-58-02.json",
-        "ipswich_town_vs_arsenal__epl_match_data_2025-04-20_13-58-02.json",
-        "manchester_united_vs_wolverhampton_wanderers__epl_match_data_2025-04-20_13-58-02.json"
-    ],
-    "Group 4: 4-Fold EPL Acca (2025-04-19)": [
-        "brentford_vs_brighton_and_hove_albion__epl_match_data_2025-04-19_14-58-01.json",
-        "crystal_palace_vs_bournemouth__epl_match_data_2025-04-19_14-58-01.json",
-        "everton_vs_manchester_city__epl_match_data_2025-04-19_14-58-01.json",
-        "west_ham_united_vs_southampton__epl_match_data_2025-04-19_14-58-01.json"
-    ]
 }
 
 # These now represent ELAPSED time from kick-off in minutes.
