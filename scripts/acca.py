@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Stax Meta-Model - ACCUMULATOR BACKTESTER (with Halftime Logic & HTML Report)
+Stax Meta-Model - ACCUMULATOR BACKTESTER (with Confidence Filter)
 
 This script loads pre-trained models and runs a specific backtest on multiple
-hardcoded sets of concurrent matches to evaluate accumulator performance.
-It generates a detailed HTML report of the results.
+hardcoded sets of concurrent matches. It can optionally filter accumulator
+legs by a minimum confidence threshold provided via command-line argument.
 """
 
 import json
@@ -16,6 +16,7 @@ import xgboost as xgb
 import joblib
 from sklearn.preprocessing import StandardScaler
 import warnings
+import argparse
 from typing import List, Tuple, Optional, Dict
 from datetime import datetime
 
@@ -31,7 +32,7 @@ STAX_MODEL_DIR = MODELS_DIR / "stax_kfold" # Use the K-Fold trained models
 REPORT_FILE = Path(__file__).resolve().parent / "acca_backtest_report.html"
 
 # --- Backtest Parameters ---
-# Using a dictionary to hold all groups of concurrent matches for testing
+# Dictionary containing all groups of concurrent matches for testing
 ACCA_GROUPS = {
     "Group 1: 6-Fold EFL Acca (2025-02-12)": [
         "bristol_city_vs_stoke_city__efl_match_data_2025-02-12_19-44-01.json",
@@ -130,7 +131,7 @@ ACCA_GROUPS = {
 }
 
 # These now represent ELAPSED time from kick-off in minutes.
-ACCA_TIMES = [10, 15, 20, 25, 30, 35, 45, 52, 75, 90] # 52m = mid-halftime, 75m = 60 mins play, 90m = 75 mins play
+ACCA_TIMES = [10, 15, 20, 25, 30, 35, 45, 52, 75, 90]
 ACCA_STAKE = 10.0
 SEQUENCE_LENGTH = 5
 
@@ -164,7 +165,6 @@ class StaxModelLoader:
         config = joblib.load(config_path)
         self.model_weights, self.ensemble_method = config['model_weights'], config['ensemble_method']
         
-        # --- FIXED MODEL LOADING LOGIC ---
         lr_dir = self.output_dir / "logistic_regression"
         xgb_dir = self.output_dir / "xgboost"
         lstm_dir = self.output_dir / "lstm"
@@ -177,7 +177,6 @@ class StaxModelLoader:
         
         self.models['lstm'] = tf.keras.models.load_model(lstm_dir / "model.h5")
         self.scalers['lstm'] = joblib.load(lstm_dir / "scaler.pkl")
-        # --- END OF FIX ---
 
         for model_type in ['lr', 'rf', 'weighted_rf']:
             model_path = self.output_dir / f"meta_model_{model_type}.joblib"
@@ -195,10 +194,7 @@ class StaxModelLoader:
 
         target_idx = int(elapsed_time_in_minutes * 60 / 40)
         
-        if target_idx >= len(df_xgb):
-            print(f"Warning: Time {elapsed_time_in_minutes}m (index {target_idx}) is beyond match data length ({len(df_xgb)}).")
-            return None
-            
+        if target_idx >= len(df_xgb): return None
         if target_idx < SEQUENCE_LENGTH: return None
 
         meta_features = self.get_meta_features_for_row(df_xgb, lstm_features_df, target_idx)
@@ -207,6 +203,7 @@ class StaxModelLoader:
         probs = self.predict_with_best_model(meta_features)
         
         prediction_index = np.argmax(probs)
+        confidence = probs[prediction_index]
         prediction_odds = df_xgb.iloc[target_idx][['avg_home_odds', 'avg_away_odds', 'avg_draw_odds']].values[prediction_index]
         prediction_map = {0: "Home Win", 1: "Away Win", 2: "Draw"}
         
@@ -214,7 +211,8 @@ class StaxModelLoader:
             "prediction_text": prediction_map[prediction_index],
             "prediction_index": prediction_index,
             "odds": prediction_odds,
-            "actual_outcome": outcome
+            "actual_outcome": outcome,
+            "confidence": confidence
         }
 
     # --- Helper and data processing functions ---
@@ -304,10 +302,11 @@ class StaxModelLoader:
         return pred[0] / pred[0].sum()
 
 
-def run_acca_backtest(stax_model, match_files, time_intervals):
+def run_acca_backtest(stax_model, match_files, time_intervals, confidence_threshold=None):
     """Runs the accumulator backtest for the specified matches and times."""
     
     html_output = ""
+    results_for_summary = []
     all_match_data = {}
     print("Loading match data...")
     for file_name in match_files:
@@ -315,7 +314,7 @@ def run_acca_backtest(stax_model, match_files, time_intervals):
         if not file_path.exists():
             print(f"Error: Could not find {file_path}")
             html_output += f"<p>Error: Could not find {file_path}</p>"
-            return html_output
+            return html_output, []
         with open(file_path, 'r') as f:
             all_match_data[file_name] = json.load(f)
     print("Match data loaded.\n")
@@ -337,25 +336,38 @@ def run_acca_backtest(stax_model, match_files, time_intervals):
                 html_string += f"<p class='error'>{msg}</p>"
                 is_valid_acca = False
                 break
-            
+
+            # NEW: Check confidence if a threshold is provided
+            if confidence_threshold is not None:
+                if (prediction_info['confidence'] * 100) < confidence_threshold:
+                    msg = f"  - SKIPPING {match_name_short:<45} (Confidence {prediction_info['confidence']:.0%} is below {confidence_threshold}%)"
+                    print(msg)
+                    html_string += f"<p class='skipped'>{msg}</p>"
+                    continue # Skip this leg and move to the next match
+
             prediction_info['match_name'] = match_name_short
             acca_legs.append(prediction_info)
         
+        # Check if enough legs remain to form an accumulator
+        if len(acca_legs) < 2:
+            msg = "  - Not enough legs with sufficient confidence to place an accumulator."
+            print(msg)
+            html_string += f"<p class='error'>{msg}</p>"
+            is_valid_acca = False
+
         if not is_valid_acca:
-            terminal_string += "\n----------------------------------------\n"
             html_string += "<hr>"
             html_output += html_string
+            results_for_summary.append({'time': time_min, 'pnl': 'N/A'})
             print("-" * 40 + "\n")
             continue
             
         total_odds, all_legs_correct = 1.0, True
         
-        stake_str = f"  Stake: £{ACCA_STAKE:.2f}"
-        legs_header_str = "  Accumulator Legs:"
-        print(stake_str); print(legs_header_str)
-        
-        html_string += f"<p><b>Stake:</b> £{ACCA_STAKE:.2f}</p><h4>Accumulator Legs:</h4><table>"
-        html_string += "<tr><th>Match</th><th>Prediction</th><th>Odds</th><th>Result</th></tr>"
+        print(f"  Stake: £{ACCA_STAKE:.2f}")
+        print(f"  Accumulator Legs ({len(acca_legs)}-Fold):")
+        html_string += f"<p><b>Stake:</b> £{ACCA_STAKE:.2f}</p><h4>Accumulator Legs ({len(acca_legs)}-Fold):</h4><table>"
+        html_string += "<tr><th>Match</th><th>Prediction</th><th>Confidence</th><th>Odds</th><th>Result</th></tr>"
 
         for leg in acca_legs:
             total_odds *= leg['odds']
@@ -363,9 +375,8 @@ def run_acca_backtest(stax_model, match_files, time_intervals):
             if not is_correct: all_legs_correct = False
             
             result_icon = "✅" if is_correct else "❌"
-            leg_str = f"    - {leg['match_name']:<45} -> Predicted: {leg['prediction_text']:<10} @ {leg['odds']:.2f} {result_icon}"
-            print(leg_str)
-            html_string += f"<tr><td>{leg['match_name']}</td><td>{leg['prediction_text']}</td><td>{leg['odds']:.2f}</td><td>{result_icon}</td></tr>"
+            print(f"    - {leg['match_name']:<45} -> Predicted: {leg['prediction_text']:<10} ({leg['confidence']:.0%}) @ {leg['odds']:.2f} {result_icon}")
+            html_string += f"<tr><td>{leg['match_name']}</td><td>{leg['prediction_text']}</td><td>{leg['confidence']:.1%}</td><td>{leg['odds']:.2f}</td><td>{result_icon}</td></tr>"
 
         html_string += "</table>"
         potential_payout = ACCA_STAKE * total_odds
@@ -385,11 +396,51 @@ def run_acca_backtest(stax_model, match_files, time_intervals):
         html_string += f"<b>Profit/Loss:</b> £{pnl:.2f}</div><hr>"
         
         html_output += html_string
+        results_for_summary.append({'time': time_min, 'pnl': pnl})
         
-    return html_output
+    return html_output, results_for_summary
 
-def generate_html_report(all_html_content):
+def generate_summary_table(summary_data: Dict[str, List[Dict]]) -> str:
+    """Generates an HTML summary table from the collected results."""
+    records = []
+    for group, results in summary_data.items():
+        for result in results:
+            records.append({'group': group, 'time': result['time'], 'pnl': result['pnl']})
+    
+    if not records:
+        return "<p>No summary data available.</p>"
+        
+    df = pd.DataFrame(records)
+    
+    pivot_df = df.pivot(index='time', columns='group', values='pnl').fillna('N/A')
+    
+    html = "<h2>Executive Summary</h2>"
+    html += "<p>This table summarizes the Profit/Loss for each accumulator group at each time interval.</p>"
+    html += "<table>"
+    
+    html += "<thead><tr><th>Time (Mins)</th>"
+    for col in pivot_df.columns:
+        html += f"<th>{col}</th>"
+    html += "</tr></thead>"
+    
+    html += "<tbody>"
+    for index, row in pivot_df.iterrows():
+        html += f"<tr><td><b>{index}</b></td>"
+        for pnl in row:
+            if isinstance(pnl, (int, float)):
+                pnl_val = float(pnl)
+                className = 'win' if pnl_val > 0 else 'loss'
+                html += f"<td class='{className}'>£{pnl_val:.2f}</td>"
+            else:
+                html += "<td>N/A</td>"
+        html += "</tr>"
+    html += "</tbody></table>"
+    
+    return html
+
+def generate_html_report(summary_html, details_html, confidence_threshold):
     """Generates the final HTML report file."""
+    title_suffix = f" (Confidence Threshold: {confidence_threshold}%)" if confidence_threshold else ""
     html_template = f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -399,26 +450,32 @@ def generate_html_report(all_html_content):
         <title>Stax Accumulator Backtest Report</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; background-color: #f4f7f9; color: #333; }}
-            .container {{ max-width: 900px; margin: 20px auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-            h1 {{ color: #1a2b4d; border-bottom: 2px solid #e1e8ed; padding-bottom: 10px; }}
-            h2 {{ color: #2a4c8d; border-bottom: 1px solid #e1e8ed; padding-bottom: 8px; margin-top: 30px;}}
-            h3 {{ color: #333; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
-            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
+            .container {{ max-width: 1200px; margin: 20px auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+            h1, h2, h3 {{ color: #1a2b4d; }}
+            h1 {{ border-bottom: 2px solid #e1e8ed; padding-bottom: 10px; }}
+            h2 {{ border-bottom: 1px solid #e1e8ed; padding-bottom: 8px; margin-top: 40px;}}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 0.9em; }}
+            th, td {{ padding: 12px 15px; text-align: left; border-bottom: 1px solid #ddd; }}
             th {{ background-color: #f8f9fa; }}
             tr:nth-child(even) {{ background-color: #f2f2f2; }}
             .summary {{ margin-top: 15px; padding: 15px; background-color: #eef2f5; border-left: 4px solid #6c757d; }}
-            .win {{ color: #28a745; font-weight: bold; }}
-            .loss {{ color: #dc3545; font-weight: bold; }}
-            .error {{ color: #dc3545; font-style: italic; }}
+            .win {{ color: #155724; background-color: #d4edda; font-weight: bold; }}
+            .loss {{ color: #721c24; background-color: #f8d7da; font-weight: bold; }}
+            .error, .skipped {{ color: #721c24; font-style: italic; }}
             hr {{ border: none; height: 1px; background-color: #e1e8ed; margin: 30px 0; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>Stax Accumulator Backtest Report</h1>
+            <h1>Stax Accumulator Backtest Report{title_suffix}</h1>
             <p>Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-            {''.join(all_html_content)}
+            
+            {summary_html}
+            
+            <hr>
+            
+            <h1>Detailed Backtest Results</h1>
+            {''.join(details_html)}
         </div>
     </body>
     </html>
@@ -429,21 +486,33 @@ def generate_html_report(all_html_content):
 
 def main():
     """Main function to initialize models and run the backtests."""
+    parser = argparse.ArgumentParser(description='Stax Meta-Model Accumulator Backtester')
+    parser.add_argument('--confidence', type=int, default=None,
+                        help='Minimum confidence level in percent (e.g., 75). Only legs meeting this are included.')
+    args = parser.parse_args()
+
     print("=== Stax Accumulator Backtester ===")
+    if args.confidence:
+        print(f"Running with a minimum confidence threshold of {args.confidence}%")
     
     stax_model = StaxModelLoader()
     stax_model.load_saved_models()
     
-    all_results_html = []
+    all_details_html = []
+    all_summary_data = {}
     
     for group_name, match_files in ACCA_GROUPS.items():
         print(f"\n\n{'='*20}\nTesting: {group_name}\n{'='*20}")
-        all_results_html.append(f"<h1>{group_name}</h1>")
+        all_details_html.append(f"<h2>{group_name}</h2>")
         
-        group_html = run_acca_backtest(stax_model, match_files, ACCA_TIMES)
-        all_results_html.append(group_html)
+        group_details_html, group_summary_data = run_acca_backtest(stax_model, match_files, ACCA_TIMES, args.confidence)
+        
+        all_details_html.append(group_details_html)
+        all_summary_data[group_name] = group_summary_data
 
-    generate_html_report(all_results_html)
+    summary_html_table = generate_summary_table(all_summary_data)
+    generate_html_report(summary_html_table, all_details_html, args.confidence)
+
     print("\n--- All Accumulator Backtests Complete ---")
 
 if __name__ == '__main__':
