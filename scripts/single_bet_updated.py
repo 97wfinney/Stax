@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
+"""
+single_bet_v8.py
 
+Simplified version: runs filtered single-bet backtest and prints summary & detailed results to terminal.
+Filters:
+  • Only EPL/FPL matches
+  • Skip score-lines 1-0 or 0-1
+  • Skip odds ≤2.0
+  • Skip draw predictions
+  • Proper Kelly bankroll updates
+"""
 
 import json
 import argparse
-# Backtest options: use --kelly to specify a fractional Kelly stake (0 = flat stake)
-import sys
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -17,7 +25,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 # --- PATHS & CONSTANTS ---
 ROOT_DIR = Path(__file__).resolve().parent
 BACKTEST_DIR = ROOT_DIR.parent / "data" / "Backtest"
-STAX_MODEL_DIR = ROOT_DIR.parent / "models" / "stax3"
+STAX_MODEL_DIR = ROOT_DIR.parent / "models" / "stax_kfold"
 
 LR_FEATURES = ['home_score','away_score','avg_home_odds','avg_away_odds','avg_draw_odds']
 XGB_FEATURES = [
@@ -68,32 +76,27 @@ def get_match_features(data):
 
 # --- ANALYZER ---
 class SingleBetTester:
-    def __init__(self, threshold, flat_stake, initial_bank, kelly_fraction):
+    def __init__(self, threshold, kelly_fraction, initial_bank):
         self.threshold = threshold
-        self.flat_stake = flat_stake
-        self.initial_bank = initial_bank
         self.kelly_fraction = kelly_fraction
+        self.initial_bank = initial_bank
         self._load_models()
 
     def _load_models(self):
-        # Try loading config from stax3, otherwise fallback to stax_kfold
-        config_path = STAX_MODEL_DIR / 'stax_config.joblib'
-        if not config_path.exists():
-            config_path = STAX_MODEL_DIR.parent / 'stax_kfold' / 'stax_config.joblib'
-        cfg = joblib.load(config_path)
-        self.weights = cfg.get('model_weights', [0.34, 0.33, 0.33])
+        cfg = joblib.load(STAX_MODEL_DIR/'stax_config.joblib')
+        self.weights = cfg.get('model_weights',[0.34,0.33,0.33])
         # load logistic, xgboost, lstm
         self.models = {}
         self.scalers = {}
-        lr_dir = STAX_MODEL_DIR / 'logistic_regression'
-        self.models['lr'] = joblib.load(lr_dir / 'model.joblib')
-        self.scalers['lr'] = joblib.load(lr_dir / 'scaler.joblib')
-        xgb_dir = STAX_MODEL_DIR / 'xgboost'
-        self.models['xgb'] = joblib.load(xgb_dir / 'model.joblib')
-        self.scalers['xgb'] = joblib.load(xgb_dir / 'scaler.joblib')
-        lstm_dir = STAX_MODEL_DIR / 'lstm'
-        self.models['lstm'] = tf.keras.models.load_model(str(lstm_dir / 'model.h5'))
-        self.scalers['lstm'] = joblib.load(lstm_dir / 'scaler.pkl')
+        lr_dir = STAX_MODEL_DIR/'logistic_regression'
+        self.models['lr'] = joblib.load(lr_dir/'model.joblib')
+        self.scalers['lr'] = joblib.load(lr_dir/'scaler.joblib')
+        xgb_dir = STAX_MODEL_DIR/'xgboost'
+        self.models['xgb'] = joblib.load(xgb_dir/'model.joblib')
+        self.scalers['xgb'] = joblib.load(xgb_dir/'scaler.joblib')
+        lstm_dir = STAX_MODEL_DIR/'lstm'
+        self.models['lstm'] = tf.keras.models.load_model(str(lstm_dir/'model.h5'))
+        self.scalers['lstm'] = joblib.load(lstm_dir/'scaler.pkl')
 
     def _predict_probs(self, df):
         lr_p = self.models['lr'].predict_proba(self.scalers['lr'].transform(df[LR_FEATURES]))
@@ -114,11 +117,20 @@ class SingleBetTester:
         ens = self.weights[0]*lr_p + self.weights[1]*xgb_p + self.weights[2]*lstm_p
         return ens
 
+    def _kelly_stake(self, p, o, bank):
+        edge = p*o - 1
+        if edge <= 0:
+            return 0.0
+        f = edge/(o-1) * self.kelly_fraction
+        return min(f*bank, bank)
 
-    def run(self, verbose=True):
+    def run(self):
         bank = self.initial_bank
         history = []
         for f in sorted(BACKTEST_DIR.glob('*.json')):
+            nm = f.name.lower()
+            if not ('epl' in nm or 'fpl' in nm):
+                continue
             data = json.load(open(f))
             df, outcome = get_match_features(data)
             if df is None:
@@ -127,26 +139,23 @@ class SingleBetTester:
             for i, row in df.iterrows():
                 if i < SEQUENCE_LENGTH:
                     continue
+                # skip losing 1-0 states
+                if (row.home_score, row.away_score) in [(0,1),(1,0)]:
+                    continue
                 p = probs[i]
                 conf = float(p.max()); idx = int(p.argmax())
+                # skip draw predictions
+                if idx == 2:
+                    continue
                 if conf < self.threshold:
                     continue
-                # determine the selected odds before any staking logic
                 odds = float(row[['avg_home_odds','avg_away_odds','avg_draw_odds']].iloc[idx])
-                if self.kelly_fraction > 0:
-                    # fractional Kelly criterion
-                    # skip cases where odds == 1 to avoid zero division
-                    if odds <= 1.0:
-                        continue
-                    edge = conf * odds - 1
-                    frac = edge / (odds - 1)
-                    stake = frac * self.kelly_fraction * bank
-                    # clamp to available bank
-                    stake = max(0.0, min(stake, bank))
-                    if stake < 0.01:
-                        continue
-                else:
-                    stake = self.flat_stake
+                # skip odds in 1.0-2.0 range
+                if odds <= 2.0:
+                    continue
+                stake = self._kelly_stake(conf, odds, bank)
+                if stake < 0.01:
+                    continue
                 pnl = stake*(odds-1) if idx==outcome else -stake
                 bank += pnl
                 minute = int(((row.time_elapsed_s - HALF_TIME_BREAK) if row.time_elapsed_s>45*60 else row.time_elapsed_s)//60)
@@ -154,7 +163,7 @@ class SingleBetTester:
                     'file': f.name,
                     'minute': minute,
                     'state': f"{int(row.home_score)}-{int(row.away_score)}",
-                    'pred': ['Home','Away','Draw'][idx],
+                    'pred': ['Home','Away'][idx],
                     'actual': ['Home','Away','Draw'][outcome],
                     'conf': conf,
                     'odds': odds,
@@ -164,55 +173,24 @@ class SingleBetTester:
                 })
                 break  # one bet per match
         if not history:
-            if verbose:
-                print("No bets placed.")
-            return pd.DataFrame(), self.initial_bank, 0.0, 0.0, 0.0, 0.0
+            print("No bets placed.")
+            return
         dfh = pd.DataFrame(history)
         # summary
         total_pnl = dfh['pnl'].sum()
         total_staked = dfh['stake'].sum()
         roi = (total_pnl/total_staked*100) if total_staked>0 else 0
         win_rate = dfh['pnl'].gt(0).mean()*100
-        if verbose:
-            print(f"Bets: {len(dfh)}, Final Bank: £{bank:.2f}")
-            print(f"Total P&L: £{total_pnl:.2f}, ROI: {roi:.2f}%, Win Rate: {win_rate:.1f}%")
-            print("Detailed history:")
-            print(dfh[['file','minute','state','pred','actual','conf','odds','stake','pnl','bank']].to_string(index=False))
-        return dfh, bank, total_pnl, total_staked, roi, win_rate
-
-def run_analysis(flat_stake, initial_bank):
-    import pandas as pd
-    thresholds = [i/100 for i in range(50,100,5)]
-    kellys = [i/10 for i in range(0,11)]
-    results = []
-    for t in thresholds:
-        for k in kellys:
-            tester = SingleBetTester(t, flat_stake, initial_bank, k)
-            dfh, bank, total_pnl, total_staked, roi, win_rate = tester.run(verbose=False)
-            results.append({
-                'threshold': t,
-                'kelly': k,
-                'final_bank': bank,
-                'pnl': total_pnl,
-                'roi': roi,
-                'win_rate': win_rate
-            })
-    df = pd.DataFrame(results)
-    df = df.sort_values(by='roi', ascending=False).head(10)
-    print(df.to_string(index=False))
+        print(f"Bets: {len(dfh)}, Final Bank: £{bank:.2f}")
+        print(f"Total P&L: £{total_pnl:.2f}, ROI: {roi:.2f}%, Win Rate: {win_rate:.1f}%")
+        print("Detailed history:")
+        print(dfh[['file','minute','state','pred','actual','conf','odds','stake','pnl','bank']].to_string(index=False))
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--threshold', type=float, default=0.50, help="Confidence threshold to bet")
-    parser.add_argument('--flat-stake', type=float, default=1.0, help="Flat stake per bet")
-    parser.add_argument('--initial-bank', type=float, default=100.0, help="Starting bank")
-    parser.add_argument('--kelly', type=float, default=0.0, help="Fractional Kelly stake (0 for flat-stake mode)")
-    parser.add_argument('--analysis', action='store_true',
-                        help="Run grid analysis of confidence thresholds and Kelly fractions")
+    parser.add_argument('--threshold', type=float, default=0.50)
+    parser.add_argument('--kelly-fraction', type=float, default=0.1)
+    parser.add_argument('--initial-bank', type=float, default=100.0)
     args = parser.parse_args()
-    if args.analysis:
-        run_analysis(args.flat_stake, args.initial_bank)
-    else:
-        tester = SingleBetTester(args.threshold, args.flat_stake,
-                                 args.initial_bank, args.kelly)
-        tester.run()
+    tester = SingleBetTester(args.threshold, args.kelly_fraction, args.initial_bank)
+    tester.run()
