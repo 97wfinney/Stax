@@ -26,6 +26,10 @@ from datetime import datetime
 import shutil
 import gc
 
+# Keras layers for neural meta-model
+from tensorflow.keras.layers import Input, Embedding, Flatten, Concatenate, Dense, BatchNormalization, Dropout
+from tensorflow.keras.models import Model
+
 # Suppress warnings
 warnings.filterwarnings('ignore')
 tf.get_logger().setLevel('ERROR')
@@ -34,7 +38,7 @@ tf.get_logger().setLevel('ERROR')
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 MODELS_DIR = ROOT_DIR / "models"
-STAX_MODEL_DIR = MODELS_DIR / "stax_kfold"
+STAX_MODEL_DIR = MODELS_DIR / "stax3"
 TEMP_MODEL_DIR = MODELS_DIR / "temp_kfold"  # For temporary k-fold models
 
 # Model parameters
@@ -264,136 +268,178 @@ class EnhancedStaxModel:
     def generate_kfold_meta_features(self, training_dir: Path) -> pd.DataFrame:
         """Generate meta-features using k-fold cross-validation."""
         print(f"\n=== Generating K-Fold Meta-Features ({K_FOLDS} folds) ===")
-        
+
         # Load all files and split into folds
         all_files = self.load_all_training_files(training_dir)
+
+        # Build team and league indices for embeddings
+        teams = set()
+        leagues = set()
+        for fp in all_files:
+            data = json.load(open(fp, 'r'))
+            match_name = data[0].get('match', '')
+            home, away = self.get_team_names(match_name, data[0].get('odds', {}))
+            if home: teams.add(home)
+            if away: teams.add(away)
+            league = data[0].get('league', 'unknown')
+            leagues.add(league)
+        self.team_to_idx = {team: i+1 for i, team in enumerate(sorted(teams))}
+        self.team_to_idx['unknown'] = 0
+        self.league_to_idx = {lg: i+1 for i, lg in enumerate(sorted(leagues))}
+        self.league_to_idx['unknown'] = 0
+        self.num_teams = len(self.team_to_idx)
+        self.num_leagues = len(self.league_to_idx)
+
         folds = self.split_files_into_folds(all_files, K_FOLDS)
-        
+
         all_meta_features = []
-        
+
         # For each fold
         for fold_idx in range(K_FOLDS):
             print(f"\nProcessing Fold {fold_idx + 1}/{K_FOLDS}")
-            
+
             # Get train and validation files
             val_files = folds[fold_idx]
             train_files = []
             for i in range(K_FOLDS):
                 if i != fold_idx:
                     train_files.extend(folds[i])
-            
+
             print(f"  Training on {len(train_files)} files, validating on {len(val_files)} files")
-            
+
             # Train models on train_files
             lr_model, lr_scaler = self.train_lr_on_files(train_files, fold_idx)
             xgb_model, xgb_scaler = self.train_xgb_on_files(train_files, fold_idx)
             lstm_model, lstm_scaler = self.train_lstm_on_files(train_files, fold_idx)
-            
+
             # Generate predictions on val_files
             print(f"  Generating predictions for fold {fold_idx+1}...")
             fold_meta_features = self.generate_predictions_for_files(
-                val_files, lr_model, lr_scaler, xgb_model, xgb_scaler, 
+                val_files, lr_model, lr_scaler, xgb_model, xgb_scaler,
                 lstm_model, lstm_scaler
             )
-            
+
             all_meta_features.append(fold_meta_features)
-            
+
             # Clean up fold models to save memory
             del lr_model, xgb_model, lstm_model
             tf.keras.backend.clear_session()
             gc.collect()
-        
+
         # Combine all fold predictions
         final_meta_df = pd.concat(all_meta_features, ignore_index=True)
         print(f"\nGenerated {len(final_meta_df)} total meta-feature samples")
-        
+
         return final_meta_df
     
-    def generate_predictions_for_files(self, files: List[Path], 
-                                     lr_model, lr_scaler, 
-                                     xgb_model, xgb_scaler, 
+    def generate_predictions_for_files(self, files: List[Path],
+                                     lr_model, lr_scaler,
+                                     xgb_model, xgb_scaler,
                                      lstm_model, lstm_scaler) -> pd.DataFrame:
         """Generate predictions for a set of files using provided models."""
         meta_data = []
-        
+
         for file_path in tqdm(files, desc="    Generating predictions", leave=False):
             with open(file_path, 'r') as f:
                 match_data = json.load(f)
-            
+
             df_lr, outcome = self.process_match_for_lr(match_data)
             df_xgb, _ = self.process_match_for_xgb(match_data)
             lstm_features_df = self.get_lstm_features_df(match_data)
-            
+
             if df_lr is None or df_xgb is None or lstm_features_df is None:
                 continue
-            
+
             for idx in range(SEQUENCE_LENGTH, min(len(df_lr), len(df_xgb), len(lstm_features_df))):
                 try:
                     # Get base model predictions
                     lr_feats = df_lr.iloc[idx][LR_FEATURES]
                     lr_scaled = lr_scaler.transform(lr_feats.values.reshape(1, -1))
                     pred_lr = lr_model.predict_proba(lr_scaled)[0]
-                    
+
                     xgb_feats = df_xgb.iloc[idx][XGB_FEATURES]
                     xgb_scaled = xgb_scaler.transform(xgb_feats.values.reshape(1, -1))
                     pred_xgb = xgb_model.predict_proba(xgb_scaled)[0]
-                    
+
                     start_idx = idx - SEQUENCE_LENGTH + 1
                     sequence_df = lstm_features_df.iloc[start_idx:idx+1]
                     if len(sequence_df) != SEQUENCE_LENGTH:
                         continue
-                    
+
                     sequence_np = sequence_df.values
                     scaled_sequence = lstm_scaler.transform(sequence_np)
                     X_lstm = scaled_sequence.reshape(1, SEQUENCE_LENGTH, sequence_np.shape[1])
                     pred_lstm = lstm_model.predict(X_lstm, verbose=0)[0]
-                    
+
                     # Calculate additional meta-features
                     entropy, std_dev, max_diff = self.calculate_model_disagreement(
                         pred_lr, pred_xgb, pred_lstm
                     )
-                    
+
                     # Time decay feature
                     time_factor = min(idx / 90, 1.0)
-                    
+
                     # Odds-based features
                     home_odds = df_xgb.iloc[idx]['avg_home_odds']
                     away_odds = df_xgb.iloc[idx]['avg_away_odds']
                     draw_odds = df_xgb.iloc[idx]['avg_draw_odds']
-                    
+
                     # Market confidence
                     market_overround = (1/home_odds + 1/away_odds + 1/draw_odds) - 1
-                    
+
                     # Create meta-feature row
                     row = {
                         # Original predictions
                         'p_lr_H': pred_lr[0], 'p_lr_A': pred_lr[1], 'p_lr_D': pred_lr[2],
                         'p_xgb_H': pred_xgb[0], 'p_xgb_A': pred_xgb[1], 'p_xgb_D': pred_xgb[2],
                         'p_lstm_H': pred_lstm[0], 'p_lstm_A': pred_lstm[1], 'p_lstm_D': pred_lstm[2],
-                        
+
                         # Aggregated predictions
                         'avg_H': (pred_lr[0] + pred_xgb[0] + pred_lstm[0]) / 3,
                         'avg_A': (pred_lr[1] + pred_xgb[1] + pred_lstm[1]) / 3,
                         'avg_D': (pred_lr[2] + pred_xgb[2] + pred_lstm[2]) / 3,
-                        
+
                         # Disagreement metrics
                         'entropy': entropy,
                         'std_dev': std_dev,
                         'max_disagreement': max_diff,
-                        
+
                         # Additional features
                         'time_factor': time_factor,
                         'market_overround': market_overround,
                         'score_diff': df_xgb.iloc[idx]['score_diff'],
-                        
+
                         # Target
                         'final_outcome': outcome
                     }
+
+                    # Embedding indices
+                    home, away = self.get_team_names(match_data[0].get('match',''), match_data[0].get('odds', {}))
+                    league = match_data[0].get('league', 'unknown')
+                    row['home_idx'] = self.team_to_idx.get(home, 0)
+                    row['away_idx'] = self.team_to_idx.get(away, 0)
+                    row['league_idx'] = self.league_to_idx.get(league, 0)
+
+                    # Match-state buckets
+                    # Convert time_elapsed_s to minute
+                    minute = int(df_xgb.iloc[idx]['time_elapsed_s'] / 60)
+                    # Bucket minute into [0-30)=0, [30-60)=1, [60-90)=2, [90+)=3
+                    row['minute_bucket'] = int(pd.cut(
+                        [minute], bins=[0, 30, 60, 90, float('inf')],
+                        labels=[0, 1, 2, 3]
+                    )[0])
+                    # Bucket score_diff into <=-2=0, -2<...<=-1=1, -1<...<0=2, 0<=...<1=3, >=2=4
+                    score_diff = df_xgb.iloc[idx]['score_diff']
+                    row['score_diff_bucket'] = int(pd.cut(
+                        [score_diff], bins=[-float('inf'), -2, -1, 0, 1, float('inf')],
+                        labels=[0, 1, 2, 3, 4]
+                    )[0])
+
                     meta_data.append(row)
-                
+
                 except Exception as e:
                     continue
-        
+
         return pd.DataFrame(meta_data)
     
     def train_final_base_models(self, training_dir: Path):
@@ -554,98 +600,103 @@ class EnhancedStaxModel:
         return weights
     
     def train_meta_models(self, X: pd.DataFrame, y: pd.Series):
-        """Train multiple meta-models and select the best."""
-        print(f"\nTraining enhanced meta-models on {len(X)} samples...")
-        
+        """Train a neural meta-model with embeddings for teams and leagues."""
+        print(f"\nTraining neural meta-model on {len(X)} samples...")
+
         # Calculate sample weights
         sample_weights = self.calculate_sample_weights(X)
-        
+
         # Split data
         X_train, X_val, y_train, y_val, w_train, w_val = train_test_split(
             X, y, sample_weights, test_size=0.2, random_state=42, stratify=y
         )
-        
-        # Drop the target column if it exists
-        feature_cols = [col for col in X.columns if col != 'final_outcome']
-        X_train = X_train[feature_cols]
-        X_val = X_val[feature_cols]
-        
-        # Initialize scalers
-        self.meta_scalers['standard'] = StandardScaler()
-        X_train_scaled = self.meta_scalers['standard'].fit_transform(X_train)
-        X_val_scaled = self.meta_scalers['standard'].transform(X_val)
-        
-        # 1. Logistic Regression
-        print("\n1. Training Logistic Regression meta-model...")
-        self.meta_models['lr'] = LogisticRegression(
-            multi_class='multinomial',
-            solver='lbfgs',
-            max_iter=1000,
-            C=0.5,
-            random_state=42
+
+        # Feature columns for meta input
+        meta_cols = [
+            'p_lr_H', 'p_lr_A', 'p_lr_D',
+            'p_xgb_H', 'p_xgb_A', 'p_xgb_D',
+            'p_lstm_H', 'p_lstm_A', 'p_lstm_D',
+            'avg_H', 'avg_A', 'avg_D',
+            'entropy', 'std_dev', 'max_disagreement',
+            'time_factor', 'market_overround', 'score_diff'
+        ]
+        # Ensure embedding indices exist
+        emb_cols = ['home_idx', 'away_idx', 'league_idx', 'minute_bucket', 'score_diff_bucket']
+        for col in emb_cols:
+            if col not in X_train.columns:
+                raise ValueError(f"Missing embedding index column: {col}")
+
+        # Prepare inputs
+        X_train_meta = X_train[meta_cols].values
+        X_val_meta = X_val[meta_cols].values
+        X_train_home = X_train['home_idx'].values
+        X_train_away = X_train['away_idx'].values
+        X_train_league = X_train['league_idx'].values
+        X_val_home = X_val['home_idx'].values
+        X_val_away = X_val['away_idx'].values
+        X_val_league = X_val['league_idx'].values
+        # Match-state bucket inputs
+        X_train_minute = X_train['minute_bucket'].values
+        X_train_score = X_train['score_diff_bucket'].values
+        X_val_minute = X_val['minute_bucket'].values
+        X_val_score = X_val['score_diff_bucket'].values
+
+        # Targets as categorical
+        y_train_cat = tf.keras.utils.to_categorical(y_train, num_classes=3)
+        y_val_cat = tf.keras.utils.to_categorical(y_val, num_classes=3)
+
+        # Build Keras model
+        meta_input = Input(shape=(len(meta_cols),), name='meta_input')
+        home_input = Input(shape=(), dtype='int32', name='home_input')
+        away_input = Input(shape=(), dtype='int32', name='away_input')
+        league_input = Input(shape=(), dtype='int32', name='league_input')
+        minute_input = Input(shape=(), dtype='int32', name='minute_input')
+        score_input = Input(shape=(), dtype='int32', name='score_input')
+
+        # Embeddings
+        home_embed = Embedding(self.num_teams+1, 8, name='home_embedding')(home_input)
+        away_embed = Embedding(self.num_teams+1, 8, name='away_embedding')(away_input)
+        league_embed = Embedding(self.num_leagues+1, 4, name='league_embedding')(league_input)
+        home_flat = Flatten()(home_embed)
+        away_flat = Flatten()(away_embed)
+        league_flat = Flatten()(league_embed)
+        # Embedding for match-state buckets
+        minute_embed = Embedding(input_dim=4, output_dim=2, name='minute_embedding')(minute_input)
+        minute_flat = Flatten()(minute_embed)
+        score_embed = Embedding(input_dim=5, output_dim=3, name='score_embedding')(score_input)
+        score_flat = Flatten()(score_embed)
+
+        x = Concatenate()([meta_input, home_flat, away_flat, league_flat, minute_flat, score_flat])
+        x = Dense(64, activation='relu')(x)
+        x = BatchNormalization()(x)
+        x = Dropout(0.3)(x)
+        x = Dense(32, activation='relu')(x)
+        x = BatchNormalization()(x)
+        x = Dropout(0.2)(x)
+        out = Dense(3, activation='softmax')(x)
+
+        model = Model(inputs=[meta_input, home_input, away_input, league_input, minute_input, score_input], outputs=out)
+        model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+        # Train model
+        history = model.fit(
+            [X_train_meta, X_train_home, X_train_away, X_train_league, X_train_minute, X_train_score],
+            y_train_cat,
+            sample_weight=w_train,
+            validation_data=(
+                [X_val_meta, X_val_home, X_val_away, X_val_league, X_val_minute, X_val_score],
+                y_val_cat,
+                w_val
+            ),
+            epochs=25,
+            batch_size=64,
+            verbose=2
         )
-        self.meta_models['lr'].fit(X_train_scaled, y_train, sample_weight=w_train)
-        lr_pred = self.meta_models['lr'].predict(X_val_scaled)
-        lr_acc = accuracy_score(y_val, lr_pred)
-        print(f"LR Validation Accuracy: {lr_acc:.4f}")
-        
-        # 2. Random Forest
-        print("\n2. Training Random Forest meta-model...")
-        self.meta_models['rf'] = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
-            min_samples_split=20,
-            min_samples_leaf=10,
-            random_state=42,
-            n_jobs=-1
-        )
-        self.meta_models['rf'].fit(X_train, y_train, sample_weight=w_train)
-        rf_pred = self.meta_models['rf'].predict(X_val)
-        rf_acc = accuracy_score(y_val, rf_pred)
-        print(f"RF Validation Accuracy: {rf_acc:.4f}")
-        
-        # 3. Weighted Average Ensemble
-        print("\n3. Optimizing model weights...")
-        self.optimize_model_weights(X_train, y_train, X_val, y_val)
-        
-        # 4. Weighted Random Forest
-        print("\n4. Training Weighted RF with optimized features...")
-        X_train_weighted = self.create_weighted_features(X_train)
-        X_val_weighted = self.create_weighted_features(X_val)
-        
-        self.meta_models['weighted_rf'] = RandomForestClassifier(
-            n_estimators=150,
-            max_depth=12,
-            min_samples_split=15,
-            min_samples_leaf=8,
-            random_state=42,
-            n_jobs=-1
-        )
-        self.meta_models['weighted_rf'].fit(X_train_weighted, y_train, sample_weight=w_train)
-        wrf_pred = self.meta_models['weighted_rf'].predict(X_val_weighted)
-        wrf_acc = accuracy_score(y_val, wrf_pred)
-        print(f"Weighted RF Validation Accuracy: {wrf_acc:.4f}")
-        
-        # Select best model
-        accuracies = {'lr': lr_acc, 'rf': rf_acc, 'weighted_rf': wrf_acc}
-        best_model = max(accuracies, key=accuracies.get)
-        self.ensemble_method = best_model
-        print(f"\nBest model: {best_model} with accuracy {accuracies[best_model]:.4f}")
-        
-        # Print detailed report for best model
-        if best_model == 'lr':
-            best_pred = lr_pred
-        elif best_model == 'rf':
-            best_pred = rf_pred
-        else:
-            best_pred = wrf_pred
-            
-        print("\nBest Model Classification Report:")
-        print(classification_report(y_val, best_pred, 
-                                  target_names=['Home Win', 'Away Win', 'Draw']))
-        
-        # Save all models
-        self.save_models()
+
+        # Save model and config
+        self.meta_models['nn'] = model
+        self.ensemble_method = 'nn'
+        print("\nNeural meta-model trained and selected.")
     
     def optimize_model_weights(self, X_train, y_train, X_val, y_val):
         """Optimize weights for model ensemble."""
@@ -1198,80 +1249,45 @@ class ValueBettingBacktester:
 
 def main():
     parser = argparse.ArgumentParser(description='Enhanced Stax Meta-Model Pipeline with K-Fold CV')
-    parser.add_argument('--mode', choices=['train', 'backtest', 'all'], 
-                       default='all', help='Operation mode')
-    parser.add_argument('--strategies', nargs='+', type=int, 
-                       default=DEFAULT_STRATEGIES,
-                       help='Betting time strategies in minutes')
-    parser.add_argument('--conf_thresholds', nargs='+', type=float,
-                       default=[0.55, 0.60, 0.65, 0.70],
-                       help='Confidence thresholds to test')
-    parser.add_argument('--value_thresholds', nargs='+', type=float,
-                       default=[0.00, 0.05, 0.10, 0.15],
-                       help='Value thresholds to test')
     parser.add_argument('--k_folds', type=int, default=K_FOLDS,
-                       help='Number of folds for cross-validation')
-    
+                        help='Number of folds for cross-validation')
     args = parser.parse_args()
-    
+
+    # create a separate folder for stax3 models
+    (MODELS_DIR / "stax3").mkdir(parents=True, exist_ok=True)
     # Initialize Enhanced Stax model
     stax = EnhancedStaxModel()
-    
-    if args.mode in ['train', 'all']:
-        print("=== Training Enhanced Stax Meta-Model with K-Fold Cross-Validation ===")
-        print(f"Using {args.k_folds}-fold cross-validation")
-        
-        # Generate k-fold meta-features
-        meta_df = stax.generate_kfold_meta_features(DATA_DIR / "Training")
-        
-        if meta_df.empty:
-            print("No meta-features generated. Exiting.")
-            return
-        
-        print(f"\nGenerated {len(meta_df)} meta-feature samples using k-fold CV")
-        
-        # Save meta-features for inspection
-        meta_df.to_csv(stax.output_dir / "kfold_meta_features.csv", index=False)
-        print(f"Saved meta-features to {stax.output_dir / 'kfold_meta_features.csv'}")
-        
-        # Prepare data
-        y_meta = meta_df['final_outcome']
-        
-        # Train meta-models
-        stax.train_meta_models(meta_df, y_meta)
-        
-        # Train final base models on all data
-        stax.train_final_base_models(DATA_DIR / "Training")
-        
-        # Clean up temporary directory
-        stax.cleanup_temp_dir()
-        
-        print("\n✅ Training complete!")
-    
-    if args.mode in ['backtest', 'all']:
-        # Load trained models if only backtesting
-        if args.mode == 'backtest':
-            stax.load_saved_models()
-        
-        print("\n=== Running Advanced Backtest ===")
-        backtester = ValueBettingBacktester(stax)
-        
-        # Run backtest with multiple threshold configurations
-        backtester.run_advanced_backtest(
-            DATA_DIR / "Backtest", 
-            args.strategies,
-            args.conf_thresholds,
-            args.value_thresholds
-        )
-        
-        # Comprehensive analysis
-        best_config, summary = backtester.analyze_comprehensive_results()
-        
-        print(f"\n✅ Analysis complete! Results saved to {stax.output_dir}")
-        print(f"📊 Best configuration: Confidence>{best_config[0]:.2f}, Value>{best_config[1]:.2f}")
-        print(f"💰 Best ROI: {summary.loc[best_config, 'roi']:.2f}%")
-    
-    print("\n--- Enhanced Stax Meta-Model Pipeline Complete ---")
+
+    print("=== Training Enhanced Stax Meta-Model with K-Fold Cross-Validation ===")
+    print(f"Using {args.k_folds}-fold cross-validation")
+
+    # Generate k-fold meta-features
+    meta_df = stax.generate_kfold_meta_features(DATA_DIR / "Training")
+
+    if meta_df.empty:
+        print("No meta-features generated. Exiting.")
+        return
+
+    print(f"\nGenerated {len(meta_df)} meta-feature samples using k-fold CV")
+
+    # Save meta-features for inspection
+    meta_df.to_csv(stax.output_dir / "kfold_meta_features.csv", index=False)
+    print(f"Saved meta-features to {stax.output_dir / 'kfold_meta_features.csv'}")
+
+    # Prepare data
+    y_meta = meta_df['final_outcome']
+
+    # Train meta-models
+    stax.train_meta_models(meta_df, y_meta)
+
+    # Train final base models on all data
+    stax.train_final_base_models(DATA_DIR / "Training")
+
+    # Clean up temporary directory
+    stax.cleanup_temp_dir()
+
+    print("\n✅ Training complete!")
+    print("\n--- Training Complete ---")
 
 
 if __name__ == '__main__':

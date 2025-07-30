@@ -65,6 +65,14 @@ XGB_FEATURES = [
 
 class EnhancedStaxModel:
     """Enhanced Stax meta-model with k-fold cross-validation."""
+
+    def calculate_match_minute(self, time_elapsed_s):
+        """Convert elapsed seconds to actual match minute, accounting for half-time."""
+        if time_elapsed_s <= 45 * 60:
+            return int(time_elapsed_s / 60)
+        else:
+            # subtract 15-minute half-time break
+            return int((time_elapsed_s - 15 * 60) / 60)
     
     def __init__(self):
         self.output_dir = STAX_MODEL_DIR
@@ -264,6 +272,23 @@ class EnhancedStaxModel:
         )
         
         return model
+
+    def build_simple_meta_model(self, input_dim):
+        """Build a simple, robust meta-model."""
+        model = tf.keras.Sequential([
+            tf.keras.layers.Dense(32, activation='relu', input_shape=(input_dim,)),
+            tf.keras.layers.BatchNormalization(),
+            tf.keras.layers.Dropout(0.4),
+            tf.keras.layers.Dense(16, activation='relu'),
+            tf.keras.layers.Dropout(0.3),
+            tf.keras.layers.Dense(3, activation='softmax')
+        ])
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(0.0001),
+            loss='categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        return model
     
     def generate_kfold_meta_features(self, training_dir: Path) -> pd.DataFrame:
         """Generate meta-features using k-fold cross-validation."""
@@ -333,11 +358,15 @@ class EnhancedStaxModel:
         return final_meta_df
     
     def generate_predictions_for_files(self, files: List[Path],
-                                     lr_model, lr_scaler,
-                                     xgb_model, xgb_scaler,
-                                     lstm_model, lstm_scaler) -> pd.DataFrame:
-        """Generate predictions for a set of files using provided models."""
+                                 lr_model, lr_scaler,
+                                 xgb_model, xgb_scaler,
+                                 lstm_model, lstm_scaler) -> pd.DataFrame:
+        """Generate predictions for a set of files using provided models with strategic time sampling."""
         meta_data = []
+        
+        # Sample at specific minutes to avoid overfitting to early times
+        target_minutes = [5, 10, 15, 20, 25, 30, 35, 40, 45,  # First half
+                         50, 55, 60, 65, 70, 75, 80, 85, 90]   # Second half
 
         for file_path in tqdm(files, desc="    Generating predictions", leave=False):
             with open(file_path, 'r') as f:
@@ -347,10 +376,30 @@ class EnhancedStaxModel:
             df_xgb, _ = self.process_match_for_xgb(match_data)
             lstm_features_df = self.get_lstm_features_df(match_data)
 
-            if df_lr is None or df_xgb is None or lstm_features_df is None:
+            if (df_lr is None or df_xgb is None or lstm_features_df is None
+                    or df_xgb.empty):
                 continue
 
-            for idx in range(SEQUENCE_LENGTH, min(len(df_lr), len(df_xgb), len(lstm_features_df))):
+            # Add minute calculation to df_xgb if not already present
+            df_xgb['minute'] = df_xgb['time_elapsed_s'].apply(
+                lambda x: self.calculate_match_minute(x)
+            )
+
+            # Sample only at target minutes
+            for target_minute in target_minutes:
+                # Find the index closest to this minute
+                minute_diff = (df_xgb['minute'] - target_minute).abs()
+                
+                # Skip if no data within 2 minutes of target
+                if minute_diff.min() > 2:
+                    continue
+                    
+                idx = minute_diff.idxmin()
+                
+                # Ensure we have enough history for LSTM
+                if idx < SEQUENCE_LENGTH:
+                    continue
+
                 try:
                     # Get base model predictions
                     lr_feats = df_lr.iloc[idx][LR_FEATURES]
@@ -376,8 +425,9 @@ class EnhancedStaxModel:
                         pred_lr, pred_xgb, pred_lstm
                     )
 
-                    # Time decay feature
-                    time_factor = min(idx / 90, 1.0)
+                    # Time decay feature (using actual minute)
+                    actual_minute = df_xgb.iloc[idx]['minute']
+                    time_factor = min(actual_minute / 90, 1.0)
 
                     # Odds-based features
                     home_odds = df_xgb.iloc[idx]['avg_home_odds']
@@ -410,7 +460,10 @@ class EnhancedStaxModel:
                         'score_diff': df_xgb.iloc[idx]['score_diff'],
 
                         # Target
-                        'final_outcome': outcome
+                        'final_outcome': outcome,
+                        
+                        # Add actual minute for analysis
+                        'actual_minute': actual_minute
                     }
 
                     # Embedding indices
@@ -420,15 +473,13 @@ class EnhancedStaxModel:
                     row['away_idx'] = self.team_to_idx.get(away, 0)
                     row['league_idx'] = self.league_to_idx.get(league, 0)
 
-                    # Match-state buckets
-                    # Convert time_elapsed_s to minute
-                    minute = int(df_xgb.iloc[idx]['time_elapsed_s'] / 60)
-                    # Bucket minute into [0-30)=0, [30-60)=1, [60-90)=2, [90+)=3
+                    # Match-state buckets using actual minute
                     row['minute_bucket'] = int(pd.cut(
-                        [minute], bins=[0, 30, 60, 90, float('inf')],
+                        [actual_minute], bins=[0, 30, 60, 90, float('inf')],
                         labels=[0, 1, 2, 3]
                     )[0])
-                    # Bucket score_diff into <=-2=0, -2<...<=-1=1, -1<...<0=2, 0<=...<1=3, >=2=4
+                    
+                    # Score difference bucket
                     score_diff = df_xgb.iloc[idx]['score_diff']
                     row['score_diff_bucket'] = int(pd.cut(
                         [score_diff], bins=[-float('inf'), -2, -1, 0, 1, float('inf')],
@@ -440,7 +491,20 @@ class EnhancedStaxModel:
                 except Exception as e:
                     continue
 
-        return pd.DataFrame(meta_data)
+        result_df = pd.DataFrame(meta_data)
+        
+        # Print sampling statistics
+        if len(result_df) > 0:
+            print(f"    Generated {len(result_df)} samples")
+            minute_counts = result_df['actual_minute'].value_counts().sort_index()
+            print(f"    Minute distribution: Min={minute_counts.index.min()}, Max={minute_counts.index.max()}")
+            print(f"    Samples per 10-min bucket:")
+            for i in range(0, 100, 10):
+                count = ((result_df['actual_minute'] >= i) & (result_df['actual_minute'] < i+10)).sum()
+                if count > 0:
+                    print(f"      {i}-{i+9} min: {count} samples")
+        
+        return result_df
     
     def train_final_base_models(self, training_dir: Path):
         """Train final base models on all training data."""
@@ -600,19 +664,11 @@ class EnhancedStaxModel:
         return weights
     
     def train_meta_models(self, X: pd.DataFrame, y: pd.Series):
-        """Train a neural meta-model with embeddings for teams and leagues."""
-        print(f"\nTraining neural meta-model on {len(X)} samples...")
+        """Train simplified meta-model without embeddings initially."""
+        print(f"\nTraining simplified meta-model on {len(X)} samples...")
 
-        # Calculate sample weights
-        sample_weights = self.calculate_sample_weights(X)
-
-        # Split data
-        X_train, X_val, y_train, y_val, w_train, w_val = train_test_split(
-            X, y, sample_weights, test_size=0.2, random_state=42, stratify=y
-        )
-
-        # Feature columns for meta input
-        meta_cols = [
+        # Use only the core features first
+        feature_cols = [
             'p_lr_H', 'p_lr_A', 'p_lr_D',
             'p_xgb_H', 'p_xgb_A', 'p_xgb_D',
             'p_lstm_H', 'p_lstm_A', 'p_lstm_D',
@@ -620,83 +676,82 @@ class EnhancedStaxModel:
             'entropy', 'std_dev', 'max_disagreement',
             'time_factor', 'market_overround', 'score_diff'
         ]
-        # Ensure embedding indices exist
-        emb_cols = ['home_idx', 'away_idx', 'league_idx', 'minute_bucket', 'score_diff_bucket']
-        for col in emb_cols:
-            if col not in X_train.columns:
-                raise ValueError(f"Missing embedding index column: {col}")
 
-        # Prepare inputs
-        X_train_meta = X_train[meta_cols].values
-        X_val_meta = X_val[meta_cols].values
-        X_train_home = X_train['home_idx'].values
-        X_train_away = X_train['away_idx'].values
-        X_train_league = X_train['league_idx'].values
-        X_val_home = X_val['home_idx'].values
-        X_val_away = X_val['away_idx'].values
-        X_val_league = X_val['league_idx'].values
-        # Match-state bucket inputs
-        X_train_minute = X_train['minute_bucket'].values
-        X_train_score = X_train['score_diff_bucket'].values
-        X_val_minute = X_val['minute_bucket'].values
-        X_val_score = X_val['score_diff_bucket'].values
+        X_features = X[feature_cols]
 
-        # Targets as categorical
-        y_train_cat = tf.keras.utils.to_categorical(y_train, num_classes=3)
-        y_val_cat = tf.keras.utils.to_categorical(y_val, num_classes=3)
+        # Stratify by outcome and time
+        X['time_bucket'] = pd.cut(X['time_factor'], bins=5, labels=False)
+        stratify_col = X['final_outcome'].astype(str) + '_' + X['time_bucket'].astype(str)
 
-        # Build Keras model
-        meta_input = Input(shape=(len(meta_cols),), name='meta_input')
-        home_input = Input(shape=(), dtype='int32', name='home_input')
-        away_input = Input(shape=(), dtype='int32', name='away_input')
-        league_input = Input(shape=(), dtype='int32', name='league_input')
-        minute_input = Input(shape=(), dtype='int32', name='minute_input')
-        score_input = Input(shape=(), dtype='int32', name='score_input')
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_features, y, test_size=0.2, random_state=42, stratify=stratify_col
+        )
 
-        # Embeddings
-        home_embed = Embedding(self.num_teams+1, 8, name='home_embedding')(home_input)
-        away_embed = Embedding(self.num_teams+1, 8, name='away_embedding')(away_input)
-        league_embed = Embedding(self.num_leagues+1, 4, name='league_embedding')(league_input)
-        home_flat = Flatten()(home_embed)
-        away_flat = Flatten()(away_embed)
-        league_flat = Flatten()(league_embed)
-        # Embedding for match-state buckets
-        minute_embed = Embedding(input_dim=4, output_dim=2, name='minute_embedding')(minute_input)
-        minute_flat = Flatten()(minute_embed)
-        score_embed = Embedding(input_dim=5, output_dim=3, name='score_embedding')(score_input)
-        score_flat = Flatten()(score_embed)
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_val_scaled = scaler.transform(X_val)
 
-        x = Concatenate()([meta_input, home_flat, away_flat, league_flat, minute_flat, score_flat])
-        x = Dense(64, activation='relu')(x)
-        x = BatchNormalization()(x)
-        x = Dropout(0.3)(x)
-        x = Dense(32, activation='relu')(x)
-        x = BatchNormalization()(x)
-        x = Dropout(0.2)(x)
-        out = Dense(3, activation='softmax')(x)
+        model = self.build_simple_meta_model(X_train_scaled.shape[1])
 
-        model = Model(inputs=[meta_input, home_input, away_input, league_input, minute_input, score_input], outputs=out)
-        model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-
-        # Train model
-        history = model.fit(
-            [X_train_meta, X_train_home, X_train_away, X_train_league, X_train_minute, X_train_score],
-            y_train_cat,
-            sample_weight=w_train,
-            validation_data=(
-                [X_val_meta, X_val_home, X_val_away, X_val_league, X_val_minute, X_val_score],
-                y_val_cat,
-                w_val
+        callbacks = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=10,
+                restore_best_weights=True
             ),
-            epochs=25,
-            batch_size=64,
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.5,
+                patience=5,
+                min_lr=1e-5
+            )
+        ]
+
+        history = model.fit(
+            X_train_scaled,
+            tf.keras.utils.to_categorical(y_train, 3),
+            validation_data=(X_val_scaled, tf.keras.utils.to_categorical(y_val, 3)),
+            epochs=100,
+            batch_size=32,
+            callbacks=callbacks,
             verbose=2
         )
 
-        # Save model and config
-        self.meta_models['nn'] = model
-        self.ensemble_method = 'nn'
-        print("\nNeural meta-model trained and selected.")
+        # Save the simplified model and scaler
+        self.meta_models['simple_nn'] = model
+        self.meta_scalers['standard'] = scaler
+        self.ensemble_method = 'simple_nn'
+
+        # Analyze performance by time
+        self.analyze_time_performance(X_val, y_val, X_val_scaled)
+
+    def analyze_time_performance(self, X_val, y_val, X_val_scaled):
+        """Analyze model performance across different match times."""
+        # Predict on validation set
+        predictions = self.meta_models['simple_nn'].predict(X_val_scaled)
+        pred_classes = predictions.argmax(axis=1)
+
+        # Define time buckets
+        time_buckets = pd.cut(
+            X_val['time_factor'],
+            bins=[0, 0.1, 0.3, 0.5, 0.7, 1.0],
+            labels=['0-9min', '9-27min', '27-45min', '45-63min', '63-90min']
+        )
+
+        print("\nPerformance by match time:")
+        for bucket in time_buckets.cat.categories:
+            mask = time_buckets == bucket
+            if mask.sum() == 0:
+                continue
+
+            bucket_acc = (pred_classes[mask] == y_val[mask]).mean()
+            bucket_conf = predictions[mask].max(axis=1).mean()
+            bucket_samples = mask.sum()
+
+            print(f"{bucket}: Accuracy={bucket_acc:.3f}, "
+                  f"Avg Confidence={bucket_conf:.3f}, "
+                  f"Samples={bucket_samples}")
     
     def optimize_model_weights(self, X_train, y_train, X_val, y_val):
         """Optimize weights for model ensemble."""
@@ -761,9 +816,13 @@ class EnhancedStaxModel:
     
     def save_models(self):
         """Save all models and metadata."""
-        # Save meta-models
+        # Save meta-models (save Keras NN separately)
         for name, model in self.meta_models.items():
-            joblib.dump(model, self.output_dir / f"meta_model_{name}.joblib")
+            if name in ['nn', 'simple_nn']:  # Handle both cases
+                # save Keras neural meta-model in HDF5 format
+                model.save(self.output_dir / f"meta_model_{name}.h5")
+            else:
+                joblib.dump(model, self.output_dir / f"meta_model_{name}.joblib")
         
         # Save scalers
         for name, scaler in self.meta_scalers.items():
@@ -778,6 +837,9 @@ class EnhancedStaxModel:
             'kelly_fraction': KELLY_FRACTION,
             'k_folds': K_FOLDS
         }
+        # persist embedding indices for backtest
+        config['team_to_idx'] = self.team_to_idx
+        config['league_to_idx'] = self.league_to_idx
         joblib.dump(config, self.output_dir / "stax_config.joblib")
         
         print(f"\nSaved all models to {self.output_dir}")
@@ -1285,6 +1347,7 @@ def main():
 
     # Clean up temporary directory
     stax.cleanup_temp_dir()
+    stax.save_models()
 
     print("\n✅ Training complete!")
     print("\n--- Training Complete ---")
