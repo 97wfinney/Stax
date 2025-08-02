@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Stax Model</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background-color: #0a0e1a;
+            color: #ffffff;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            padding: 30px;
+            border-radius: 15px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .control-panel {
+            background: #1a1f2e;
+            padding: 25px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.2);
+        }
+        
+        .control-group {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+        }
+        
+        .control-group label {
+            font-weight: 600;
+            color: #94a3b8;
+        }
+        
+        .checkbox-group {
+            display: flex;
+            gap: 15px;
+        }
+        
+        .checkbox-group label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            cursor: pointer;
+        }
+        
+        input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+        
+        input[type="number"] {
+            background: #0f172a;
+            border: 2px solid #334155;
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 16px;
+            width: 120px;
+        }
+        
+        input[type="number"]:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+        
+        button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        button:hover {
+            background: #2563eb;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(59, 130, 246, 0.4);
+        }
+        
+        button:disabled {
+            background: #475569;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .status-bar {
+            background: #0f172a;
+            padding: 15px;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+        }
+        
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ef4444;
+        }
+        
+        .status-dot.active {
+            background: #10b981;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+        
+        .bank-info {
+            font-size: 1.2em;
+            font-weight: 600;
+            color: #10b981;
+        }
+        
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+        
+        @media (max-width: 1024px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        .section {
+            background: #1a1f2e;
+            padding: 25px;
+            border-radius: 10px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.2);
+        }
+        
+        .section h2 {
+            margin-bottom: 20px;
+            color: #e2e8f0;
+            font-size: 1.5em;
+            border-bottom: 2px solid #334155;
+            padding-bottom: 10px;
+        }
+        
+        .match-card {
+            background: #0f172a;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            border: 1px solid #334155;
+            transition: all 0.3s ease;
+        }
+        
+        .match-card:hover {
+            border-color: #3b82f6;
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.2);
+        }
+        
+        .match-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .match-teams {
+            font-weight: 600;
+            font-size: 1.1em;
+            color: #f1f5f9;
+        }
+        
+        .match-score {
+            background: #1e293b;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: 700;
+            font-size: 1.2em;
+            color: #3b82f6;
+        }
+        
+        .odds-display {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .odds-item {
+            text-align: center;
+            background: #1e293b;
+            padding: 8px;
+            border-radius: 6px;
+        }
+        
+        .odds-label {
+            font-size: 0.9em;
+            color: #94a3b8;
+            margin-bottom: 5px;
+        }
+        
+        .odds-value {
+            font-weight: 700;
+            font-size: 1.1em;
+            color: #f1f5f9;
+        }
+        
+        .prediction-card {
+            background: #0f172a;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            border: 2px solid #334155;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .prediction-card.high-confidence {
+            border-color: #10b981;
+            background: linear-gradient(135deg, #0f172a 0%, #064e3b 100%);
+        }
+        
+        .prediction-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 15px;
+        }
+        
+        .prediction-match {
+            font-weight: 600;
+            font-size: 1.1em;
+            color: #f1f5f9;
+        }
+        
+        .prediction-time {
+            font-size: 0.9em;
+            color: #94a3b8;
+        }
+        
+        .prediction-details {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+        
+        .prediction-outcome {
+            background: #1e293b;
+            padding: 10px;
+            border-radius: 6px;
+            text-align: center;
+        }
+        
+        .prediction-label {
+            font-size: 0.9em;
+            color: #94a3b8;
+            margin-bottom: 5px;
+        }
+        
+        .prediction-value {
+            font-weight: 700;
+            font-size: 1.2em;
+            color: #3b82f6;
+        }
+        
+        .confidence-meter {
+            background: #1e293b;
+            height: 8px;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 15px;
+        }
+        
+        .confidence-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #ef4444 0%, #f59e0b 50%, #10b981 100%);
+            transition: width 0.5s ease;
+        }
+        
+        .probabilities-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        .probability-item {
+            text-align: center;
+            padding: 10px;
+            background: #1e293b;
+            border-radius: 6px;
+        }
+        
+        .probability-item.selected {
+            background: #1e3a8a;
+            border: 2px solid #3b82f6;
+        }
+        
+        .stake-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-top: 15px;
+            border-top: 1px solid #334155;
+        }
+        
+        .stake-amount {
+            font-size: 1.1em;
+            font-weight: 600;
+            color: #10b981;
+        }
+        
+        .execute-btn {
+            background: #10b981;
+            padding: 8px 16px;
+            font-size: 0.9em;
+        }
+        
+        .execute-btn:hover {
+            background: #059669;
+        }
+        
+        .bets-history {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .bet-card {
+            background: #0f172a;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            border: 1px solid #334155;
+        }
+        
+        .bet-card.won {
+            border-color: #10b981;
+            background: linear-gradient(135deg, #0f172a 0%, #064e3b 100%);
+        }
+        
+        .bet-card.lost {
+            border-color: #ef4444;
+            background: linear-gradient(135deg, #0f172a 0%, #7f1d1d 100%);
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .modal-content {
+            background: #1a1f2e;
+            padding: 30px;
+            border-radius: 10px;
+            max-width: 500px;
+            width: 90%;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+        }
+        
+        .modal-header {
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            color: #f1f5f9;
+        }
+        
+        .modal-body {
+            margin-bottom: 20px;
+        }
+        
+        .modal-footer {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        
+        .alert.success {
+            background: #064e3b;
+            border: 1px solid #10b981;
+            color: #10b981;
+        }
+        
+        .alert.error {
+            background: #7f1d1d;
+            border: 1px solid #ef4444;
+            color: #ef4444;
+        }
+        
+        .loader {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #334155;
+            border-radius: 50%;
+            border-top-color: #3b82f6;
+            animation: spin 1s ease-in-out infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>🎯 Live Stax Model</h1>
+            <p>Real-time football match predictions with Kelly staking</p>
+        </div>
+        
+        <!-- Alert -->
+        <div id="alert" class="alert"></div>
+        
+        <!-- Control Panel -->
+        <div class="control-panel">
+            <div class="control-group">
+                <label>Select Leagues:</label>
+                <div class="checkbox-group">
+                    <label>
+                        <input type="checkbox" id="epl-checkbox" value="EPL">
+                        <span>EPL</span>
+                    </label>
+                    <label>
+                        <input type="checkbox" id="efl-checkbox" value="EFL">
+                        <span>EFL Championship</span>
+                    </label>
+                    <label style="background: #dc2626; padding: 5px 10px; border-radius: 5px;">
+                        <input type="checkbox" id="l1test-checkbox" value="L1TEST">
+                        <span>🧪 League 1 (TEST)</span>
+                    </label>
+                </div>
+            </div>
+            
+            <div class="control-group">
+                <label for="confidence-threshold">Confidence Threshold:</label>
+                <input type="number" id="confidence-threshold" value="0.65" min="0.5" max="0.95" step="0.05">
+                
+                <label for="kelly-fraction">Kelly Fraction:</label>
+                <input type="number" id="kelly-fraction" value="0.25" min="0.1" max="1.0" step="0.05">
+                
+                <label for="bank-amount">Bank (£):</label>
+                <input type="number" id="bank-amount" value="100" min="10" max="10000" step="10">
+                <button onclick="updateBank()">Update Bank</button>
+            </div>
+            
+            <div class="control-group">
+                <button id="start-btn" onclick="startMonitoring()">Start Monitoring</button>
+                <button id="stop-btn" onclick="stopMonitoring()" disabled>Stop Monitoring</button>
+            </div>
+        </div>
+        
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div class="status-indicator">
+                <div id="status-dot" class="status-dot"></div>
+                <span id="status-text">Not Connected</span>
+                <button onclick="refreshData()" style="margin-left: 20px; padding: 5px 15px; font-size: 14px;">🔄 Refresh</button>
+            </div>
+            <div class="bank-info">
+                Bank: £<span id="current-bank">100.00</span>
+            </div>
+        </div>
+        
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Live Matches -->
+            <div class="section">
+                <h2>📺 Live Matches</h2>
+                <div id="matches-container">
+                    <p style="color: #94a3b8;">No live matches. Start monitoring to see matches.</p>
+                </div>
+            </div>
+            
+            <!-- Predictions -->
+            <div class="section">
+                <h2>🎯 Model Predictions</h2>
+                <div id="predictions-container">
+                    <p style="color: #94a3b8;">Predictions will appear here when matches are being monitored.</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Executed Bets -->
+        <div class="section">
+            <h2>💰 Executed Bets</h2>
+            <div id="bets-container" class="bets-history">
+                <p style="color: #94a3b8;">No bets executed yet.</p>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal -->
+    <div id="bet-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">Confirm Bet Execution</div>
+            <div class="modal-body" id="modal-body"></div>
+            <div class="modal-footer">
+                <button onclick="closeModal()">Cancel</button>
+                <button class="execute-btn" onclick="confirmBet()">Execute Bet</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // WebSocket connection
+        const socket = io();
+        let currentPrediction = null;
+        let isMonitoring = false;
+        
+        // Socket event handlers
+        socket.on('connect', function() {
+            document.getElementById('status-dot').classList.add('active');
+            document.getElementById('status-text').textContent = 'Connected';
+        });
+        
+        socket.on('disconnect', function() {
+            document.getElementById('status-dot').classList.remove('active');
+            document.getElementById('status-text').textContent = 'Disconnected';
+        });
+        
+        socket.on('update', function(data) {
+            console.log('Received update:', data);  // Debug log
+            updateMatches(data.matches);
+            updatePredictions(data.predictions);
+            document.getElementById('current-bank').textContent = data.bank.toFixed(2);
+        });
+        
+        socket.on('bets_updated', function(bets) {
+            updateBetsDisplay(bets);
+        });
+        
+        // UI Functions
+        function refreshData() {
+            fetch('/api/status')
+            .then(response => response.json())
+            .then(data => {
+                console.log('Status:', data);
+                showAlert(`Active matches: ${data.active_matches}, Predictions: ${data.total_predictions}`, 'success');
+            });
+        }
+        function showAlert(message, type) {
+            const alert = document.getElementById('alert');
+            alert.className = `alert ${type}`;
+            alert.textContent = message;
+            alert.style.display = 'block';
+            setTimeout(() => {
+                alert.style.display = 'none';
+            }, 5000);
+        }
+        
+        function startMonitoring() {
+            const leagues = [];
+            if (document.getElementById('epl-checkbox').checked) leagues.push('EPL');
+            if (document.getElementById('efl-checkbox').checked) leagues.push('EFL');
+            if (document.getElementById('l1test-checkbox').checked) leagues.push('L1TEST');
+            
+            if (leagues.length === 0) {
+                showAlert('Please select at least one league', 'error');
+                return;
+            }
+            
+            const data = {
+                leagues: leagues,
+                confidence_threshold: parseFloat(document.getElementById('confidence-threshold').value),
+                kelly_fraction: parseFloat(document.getElementById('kelly-fraction').value)
+            };
+            
+            fetch('/api/start', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json())
+            .then(data => {
+                isMonitoring = true;
+                document.getElementById('start-btn').disabled = true;
+                document.getElementById('stop-btn').disabled = false;
+                showAlert('Monitoring started for: ' + data.leagues.join(', '), 'success');
+            });
+        }
+        
+        function stopMonitoring() {
+            fetch('/api/stop', {method: 'POST'})
+            .then(response => response.json())
+            .then(data => {
+                isMonitoring = false;
+                document.getElementById('start-btn').disabled = false;
+                document.getElementById('stop-btn').disabled = true;
+                showAlert('Monitoring stopped', 'success');
+            });
+        }
+        
+        function updateBank() {
+            const bank = parseFloat(document.getElementById('bank-amount').value);
+            fetch('/api/update_bank', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({bank: bank})
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('current-bank').textContent = data.bank.toFixed(2);
+                showAlert('Bank updated to £' + data.bank.toFixed(2), 'success');
+            });
+        }
+        
+        function updateMatches(matches) {
+            const container = document.getElementById('matches-container');
+            if (Object.keys(matches).length === 0) {
+                container.innerHTML = '<p style="color: #94a3b8;">No live matches found.</p>';
+                return;
+            }
+            
+            // Group matches by league
+            const matchesByLeague = { 'EPL': [], 'EFL': [], 'L1TEST': [] };
+            
+            for (const [matchId, matchData] of Object.entries(matches)) {
+                const latest = matchData[matchData.length - 1];
+                const league = latest.league || 'Unknown';
+                const [home, away] = latest.match.split(' vs ');
+                
+                // Calculate average odds
+                let homeOdds = [], awayOdds = [], drawOdds = [];
+                for (const [bookmaker, odds] of Object.entries(latest.odds)) {
+                    if (odds[home]) homeOdds.push(odds[home]);
+                    if (odds[away]) awayOdds.push(odds[away]);
+                    if (odds['Draw']) drawOdds.push(odds['Draw']);
+                }
+                
+                const avgHome = homeOdds.length ? (homeOdds.reduce((a,b) => a+b) / homeOdds.length).toFixed(2) : 'N/A';
+                const avgAway = awayOdds.length ? (awayOdds.reduce((a,b) => a+b) / awayOdds.length).toFixed(2) : 'N/A';
+                const avgDraw = drawOdds.length ? (drawOdds.reduce((a,b) => a+b) / drawOdds.length).toFixed(2) : 'N/A';
+                
+                const matchHtml = `
+                    <div class="match-card">
+                        <div class="match-header">
+                            <div class="match-teams">${latest.match}</div>
+                            <div class="match-score">${latest.score}</div>
+                        </div>
+                        <div class="odds-display">
+                            <div class="odds-item">
+                                <div class="odds-label">Home</div>
+                                <div class="odds-value">${avgHome}</div>
+                            </div>
+                            <div class="odds-item">
+                                <div class="odds-label">Draw</div>
+                                <div class="odds-value">${avgDraw}</div>
+                            </div>
+                            <div class="odds-item">
+                                <div class="odds-label">Away</div>
+                                <div class="odds-value">${avgAway}</div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                if (matchesByLeague[league]) {
+                    matchesByLeague[league].push(matchHtml);
+                }
+            }
+            
+            // Build HTML with league sections
+            let html = '';
+            if (matchesByLeague['EPL'].length > 0) {
+                html += '<h3 style="color: #3b82f6; margin-bottom: 15px;">⚽ Premier League</h3>';
+                html += matchesByLeague['EPL'].join('');
+            }
+            if (matchesByLeague['EFL'].length > 0) {
+                if (html) html += '<h3 style="color: #10b981; margin-top: 25px; margin-bottom: 15px;">🏆 Championship</h3>';
+                else html += '<h3 style="color: #10b981; margin-bottom: 15px;">🏆 Championship</h3>';
+                html += matchesByLeague['EFL'].join('');
+            }
+            if (matchesByLeague['L1TEST'].length > 0) {
+                if (html) html += '<h3 style="color: #dc2626; margin-top: 25px; margin-bottom: 15px;">🧪 League 1 (TEST)</h3>';
+                else html += '<h3 style="color: #dc2626; margin-bottom: 15px;">🧪 League 1 (TEST)</h3>';
+                html += matchesByLeague['L1TEST'].join('');
+            }
+            
+            container.innerHTML = html;
+        }
+        
+        function updatePredictions(predictions) {
+            const container = document.getElementById('predictions-container');
+            if (!predictions || predictions.length === 0) {
+                container.innerHTML = '<p style="color: #94a3b8;">No predictions yet. Waiting for sufficient match data...</p>';
+                return;
+            }
+            
+            let html = '';
+            for (const pred of predictions) {
+                const isHighConfidence = pred.confidence >= parseFloat(document.getElementById('confidence-threshold').value);
+                
+                html += `
+                    <div class="prediction-card ${isHighConfidence ? 'high-confidence' : ''}">
+                        <div class="prediction-header">
+                            <div>
+                                <div class="prediction-match">${pred.match}</div>
+                                <div class="prediction-time">Min ${pred.minute} • ${pred.score}</div>
+                            </div>
+                            <div class="prediction-time">${new Date(pred.timestamp).toLocaleTimeString()}</div>
+                        </div>
+                        
+                        <div class="confidence-meter">
+                            <div class="confidence-fill" style="width: ${pred.confidence * 100}%"></div>
+                        </div>
+                        
+                        <div class="probabilities-grid">
+                            <div class="probability-item ${pred.prediction === 'Home' ? 'selected' : ''}">
+                                <div class="prediction-label">Home</div>
+                                <div class="prediction-value">${(pred.probabilities.home * 100).toFixed(1)}%</div>
+                                <div class="odds-value">${pred.odds.home.toFixed(2)}</div>
+                            </div>
+                            <div class="probability-item ${pred.prediction === 'Draw' ? 'selected' : ''}">
+                                <div class="prediction-label">Draw</div>
+                                <div class="prediction-value">${(pred.probabilities.draw * 100).toFixed(1)}%</div>
+                                <div class="odds-value">${pred.odds.draw.toFixed(2)}</div>
+                            </div>
+                            <div class="probability-item ${pred.prediction === 'Away' ? 'selected' : ''}">
+                                <div class="prediction-label">Away</div>
+                                <div class="prediction-value">${(pred.probabilities.away * 100).toFixed(1)}%</div>
+                                <div class="odds-value">${pred.odds.away.toFixed(2)}</div>
+                            </div>
+                        </div>
+                        
+                        <div class="stake-info">
+                            <div>
+                                <span class="prediction-label">Recommended: </span>
+                                <span class="stake-amount">£${pred.recommended_stake.toFixed(2)}</span>
+                                <span class="prediction-label"> @ ${pred.selected_odds.toFixed(2)}</span>
+                            </div>
+                            ${pred.recommended_stake > 0 ? `<button class="execute-btn" onclick='executeBet(${JSON.stringify(pred)})'>Execute Bet</button>` : ''}
+                        </div>
+                    </div>
+                `;
+            }
+            container.innerHTML = html;
+        }
+        
+        function executeBet(prediction) {
+            currentPrediction = prediction;
+            const modal = document.getElementById('bet-modal');
+            const modalBody = document.getElementById('modal-body');
+            
+            modalBody.innerHTML = `
+                <p><strong>Match:</strong> ${prediction.match}</p>
+                <p><strong>Current Score:</strong> ${prediction.score}</p>
+                <p><strong>Prediction:</strong> ${prediction.prediction}</p>
+                <p><strong>Confidence:</strong> ${(prediction.confidence * 100).toFixed(1)}%</p>
+                <p><strong>Odds:</strong> ${prediction.selected_odds.toFixed(2)}</p>
+                <p><strong>Recommended Stake:</strong> £${prediction.recommended_stake.toFixed(2)}</p>
+                <p style="margin-top: 15px; color: #f59e0b;">Please confirm this bet execution. Remember to place the bet manually with your bookmaker.</p>
+            `;
+            
+            modal.style.display = 'flex';
+        }
+        
+        function closeModal() {
+            document.getElementById('bet-modal').style.display = 'none';
+            currentPrediction = null;
+        }
+        
+        function confirmBet() {
+            if (!currentPrediction) return;
+            
+            fetch('/api/execute_bet', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(currentPrediction)
+            })
+            .then(response => response.json())
+            .then(data => {
+                showAlert('Bet executed successfully!', 'success');
+                closeModal();
+                loadBets();
+            });
+        }
+        
+        function updateBetsDisplay(bets) {
+            const container = document.getElementById('bets-container');
+            if (!bets || bets.length === 0) {
+                container.innerHTML = '<p style="color: #94a3b8;">No bets executed yet.</p>';
+                return;
+            }
+            
+            let html = '';
+            let totalPnL = 0;
+            
+            for (const bet of bets.reverse()) {
+                const statusClass = bet.status === 'won' ? 'won' : (bet.status === 'lost' ? 'lost' : '');
+                if (bet.pnl) totalPnL += bet.pnl;
+                
+                html += `
+                    <div class="bet-card ${statusClass}">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                            <strong>${bet.match}</strong>
+                            <span>${new Date(bet.executed_at).toLocaleString()}</span>
+                        </div>
+                        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;">
+                            <div>
+                                <div class="prediction-label">Prediction</div>
+                                <div class="prediction-value">${bet.prediction}</div>
+                            </div>
+                            <div>
+                                <div class="prediction-label">Stake</div>
+                                <div class="prediction-value">£${bet.recommended_stake.toFixed(2)}</div>
+                            </div>
+                            <div>
+                                <div class="prediction-label">Odds</div>
+                                <div class="prediction-value">${bet.selected_odds.toFixed(2)}</div>
+                            </div>
+                            <div>
+                                <div class="prediction-label">Status</div>
+                                <div class="prediction-value" style="color: ${bet.status === 'won' ? '#10b981' : (bet.status === 'lost' ? '#ef4444' : '#f59e0b')}">
+                                    ${bet.status.toUpperCase()}
+                                    ${bet.pnl ? ` (${bet.pnl > 0 ? '+' : ''}£${bet.pnl.toFixed(2)})` : ''}
+                                </div>
+                            </div>
+                        </div>
+                        ${bet.final_score ? `
+                            <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #334155;">
+                                <span class="prediction-label">Final Score: </span>
+                                <span>${bet.final_score}</span>
+                                <span class="prediction-label" style="margin-left: 15px;">Result: </span>
+                                <span>${bet.actual_outcome || 'N/A'}</span>
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+            }
+            
+            // Add total P&L summary
+            if (totalPnL !== 0) {
+                html = `
+                    <div style="background: #1e293b; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center;">
+                        <div class="prediction-label">Total P&L</div>
+                        <div style="font-size: 1.5em; font-weight: 700; color: ${totalPnL > 0 ? '#10b981' : '#ef4444'}">
+                            ${totalPnL > 0 ? '+' : ''}£${totalPnL.toFixed(2)}
+                        </div>
+                    </div>
+                ` + html;
+            }
+            
+            container.innerHTML = html;
+        }
+        
+        function loadBets() {
+            fetch('/api/get_bets')
+            .then(response => response.json())
+            .then(bets => {
+                updateBetsDisplay(bets);
+            });
+        }
+        
+        // Load bets on page load
+        loadBets();
+        
+        // Polling fallback - update every 5 seconds
+        setInterval(function() {
+            if (isMonitoring) {
+                fetch('/api/get_current_state')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.matches) {
+                        updateMatches(data.matches);
+                    }
+                    if (data.predictions) {
+                        updatePredictions(data.predictions);
+                    }
+                    if (data.bank) {
+                        document.getElementById('current-bank').textContent = data.bank.toFixed(2);
+                    }
+                })
+                .catch(error => console.error('Polling error:', error));
+            }
+        }, 5000);
+        
+        // Load current state on page load
+        window.addEventListener('load', function() {
+            fetch('/api/get_current_state')
+            .then(response => response.json())
+            .then(data => {
+                console.log('Current state:', data);
+                if (data.matches && Object.keys(data.matches).length > 0) {
+                    updateMatches(data.matches);
+                }
+                if (data.predictions && data.predictions.length > 0) {
+                    updatePredictions(data.predictions);
+                }
+                document.getElementById('current-bank').textContent = data.bank.toFixed(2);
+            });
+        });
+        
+        // Modal close on outside click
+        window.onclick = function(event) {
+            const modal = document.getElementById('bet-modal');
+            if (event.target == modal) {
+                closeModal();
+            }
+        }
+    </script>
+</body>
+</html>
